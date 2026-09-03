@@ -13,6 +13,7 @@ These tests verify that the generator:
 
 from __future__ import annotations
 
+from collections import Counter
 from datetime import timedelta
 
 import pytest
@@ -342,3 +343,73 @@ class TestConstraints:
         assert sum(spec.arm_weights_permille.values()) == 1000
         assert spec.control_arm == Arm.A1
         assert spec.treatment_arm == Arm.A4
+
+
+# --------------------------------------------- the eval-scoped arm allocation
+
+
+def test_the_eval_weights_switch_the_cut_arms_off_explicitly():
+    """``ExperimentSpec`` requires every arm to appear, "with 0 to switch one off
+    explicitly". That is the whole reason this is expressible without a contract
+    change: an omitted arm would be an accident, a zero is a decision."""
+    from reclaim.contracts.enums import Arm
+    from reclaim.spine.seed import EVAL_ARM_WEIGHTS_PERMILLE
+
+    assert set(EVAL_ARM_WEIGHTS_PERMILLE) == set(Arm)
+    for cut in (Arm.A2, Arm.A3, Arm.A5):
+        assert EVAL_ARM_WEIGHTS_PERMILLE[cut] == 0
+    for kept in (Arm.A0, Arm.A1, Arm.A4):
+        assert EVAL_ARM_WEIGHTS_PERMILLE[kept] > 0
+
+
+def test_the_eval_weights_sum_to_the_permille_total():
+    from reclaim.contracts.experiment import PERMILLE_TOTAL
+    from reclaim.spine.seed import EVAL_ARM_WEIGHTS_PERMILLE
+
+    assert sum(EVAL_ARM_WEIGHTS_PERMILLE.values()) == PERMILLE_TOTAL
+
+
+def test_the_planned_weights_are_left_exactly_as_they_were():
+    """§12.5.1: the pre-registered allocation is not edited after the fact. The eval
+    allocation is a *second* map, chosen because three arms were cut at T-12h; the
+    planned one stays intact so the two can be told apart in the audit trail."""
+    from reclaim.contracts.experiment import PLANNED_ARM_WEIGHTS_PERMILLE
+    from reclaim.spine.seed import EVAL_ARM_WEIGHTS_PERMILLE
+
+    assert all(w > 0 for w in PLANNED_ARM_WEIGHTS_PERMILLE.values())
+    assert PLANNED_ARM_WEIGHTS_PERMILLE != EVAL_ARM_WEIGHTS_PERMILLE
+
+
+def test_the_default_spec_still_uses_the_planned_weights():
+    """The eval allocation must be opted into. If it became the default, every
+    seeded test in the suite would silently re-randomise its cases."""
+    from reclaim.contracts.experiment import PLANNED_ARM_WEIGHTS_PERMILLE
+    from reclaim.spine.seed import make_experiment_spec
+
+    assert make_experiment_spec().arm_weights_permille == PLANNED_ARM_WEIGHTS_PERMILLE
+
+
+def test_the_eval_spec_puts_real_weight_behind_the_control_arm(conn):
+    """The reason this exists at all. Under the planned six-arm split A0 draws 8% of
+    the book, which at any batch size leaves the natural-recovery reference as the
+    thinnest arm on the board -- and A0 is the one every increment is measured
+    against. With the cut arms at zero its share more than triples."""
+    from reclaim.contracts.enums import Arm
+    from reclaim.spine.seed import generate, make_eval_spec
+
+    cases = generate(conn, n=400, spec=make_eval_spec(planned_case_count=400))
+    counts = Counter(c.arm for c in cases)
+    assert counts[Arm.A2] == counts[Arm.A3] == counts[Arm.A5] == 0
+    assert counts[Arm.A0] / len(cases) > 0.20
+    assert set(counts) == {Arm.A0, Arm.A1, Arm.A4}
+
+
+def test_the_eval_spec_keeps_the_headline_comparison_the_plan_registered(conn):
+    """§12.1's control/treatment pair is A1/A4 and reweighting must not quietly
+    move it -- an allocation change is not a licence to change what is compared."""
+    from reclaim.contracts.enums import HEADLINE_CONTROL_ARM, HEADLINE_TREATMENT_ARM
+    from reclaim.spine.seed import make_eval_spec
+
+    spec = make_eval_spec()
+    assert spec.control_arm is HEADLINE_CONTROL_ARM
+    assert spec.treatment_arm is HEADLINE_TREATMENT_ARM

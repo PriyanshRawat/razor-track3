@@ -27,13 +27,15 @@ from __future__ import annotations
 import random
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Sequence
+from typing import Mapping, Sequence
 
 from sqlalchemy.engine import Connection
 
 from reclaim.contracts.decline_taxonomy import DeclineClass
 from reclaim.contracts.case import RiskCase
 from reclaim.contracts.enums import (
+    HEADLINE_CONTROL_ARM,
+    HEADLINE_TREATMENT_ARM,
     Arm,
     CaseState,
     ObligationKind,
@@ -53,7 +55,14 @@ from reclaim.contracts.strata import StratumKey
 from reclaim.contracts.temporal import UtcDatetime
 from reclaim.spine import ledger
 
-__all__ = ["generate", "make_experiment_spec", "SEED", "CASE_COUNT"]
+__all__ = [
+    "CASE_COUNT",
+    "EVAL_ARM_WEIGHTS_PERMILLE",
+    "SEED",
+    "generate",
+    "make_eval_spec",
+    "make_experiment_spec",
+]
 
 #: Fixed seed for reproducibility.
 SEED = 42
@@ -92,6 +101,36 @@ _DECLINE_CLASSES: tuple[DeclineClass, ...] = (
 )
 
 
+#: The allocation for an **eval run under the T-12h cut** (§18.4), as opposed to
+#: ``PLANNED_ARM_WEIGHTS_PERMILLE``, which is what §12.1 pre-registered for the full
+#: six-arm ladder. A2, A3 and A5 are set to 0 rather than omitted, because
+#: ``ExperimentSpec`` requires every arm to appear "with 0 to switch one off
+#: explicitly" -- an omitted arm reads as an oversight, a zero reads as a decision,
+#: and the spec digest records which of the two happened.
+#:
+#: Why reallocate at all: under the planned split A0 draws 80 permille, so the
+#: natural-recovery reference is the thinnest arm on the board at any batch size --
+#: and it is the arm every increment is measured against. Cutting three arms frees
+#: 280 permille that would otherwise be spent generating cases nobody scores; most
+#: of it goes to A0 for that reason. A1 and A4 stay near-equal because §12.1's
+#: headline differences exactly those two, and an unbalanced pair costs precision on
+#: the number that matters.
+#:
+#: This is **not** the default. ``make_experiment_spec`` still returns the planned
+#: allocation, because arm assignment is a hash of the salt and the case id against
+#: these weights: making the eval split the default would silently re-randomise every
+#: seeded test in the suite, and re-randomising after the fact is precisely what
+#: §12.5.1's pre-registration exists to prevent.
+EVAL_ARM_WEIGHTS_PERMILLE: Mapping[Arm, int] = {
+    Arm.A0: 250,
+    Arm.A1: 375,
+    Arm.A2: 0,
+    Arm.A3: 0,
+    Arm.A4: 375,
+    Arm.A5: 0,
+}
+
+
 def make_experiment_spec(
     *,
     experiment_id: str = "exp_seed_dev_001",
@@ -109,6 +148,40 @@ def make_experiment_spec(
         stopping_rule=(
             "Run all cases to completion of their recovery window; "
             "no early stopping."
+        ),
+        registered_at=registered_at or _EPOCH - timedelta(days=1),
+    )
+
+
+def make_eval_spec(
+    *,
+    experiment_id: str = "exp_seed_eval_001",
+    salt: str = "reclaim-seed-salt-v1",
+    planned_case_count: int = 2000,
+    registered_at: datetime | None = None,
+) -> ExperimentSpec:
+    """A spec allocating the whole book to the three arms that survived the cut.
+
+    Same salt as ``make_experiment_spec`` on purpose: the salt and the weights are
+    separate levers, and holding the salt fixed means the difference between the two
+    specs is attributable to the reallocation alone. ``planned_case_count`` defaults
+    to §12.4's 2,000.
+
+    The control/treatment pair is left exactly where §12.1 put it (A1/A4). Changing
+    the allocation is a resourcing decision; changing what is compared is not, and
+    doing both in one function would let the second hide behind the first.
+    """
+    return ExperimentSpec(
+        experiment_id=experiment_id,
+        experiment_salt=salt,
+        arm_weights_permille=EVAL_ARM_WEIGHTS_PERMILLE,
+        control_arm=HEADLINE_CONTROL_ARM,
+        treatment_arm=HEADLINE_TREATMENT_ARM,
+        planned_case_count=planned_case_count,
+        stopping_rule=(
+            "Run all cases to completion of their recovery window; no early "
+            "stopping. Arms A2, A3 and A5 carry zero weight under the T-12h cut "
+            "(HACKATHON_PLAN.md 18.4) and are not scored."
         ),
         registered_at=registered_at or _EPOCH - timedelta(days=1),
     )
