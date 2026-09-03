@@ -407,17 +407,46 @@ def test_the_resolved_only_basis_drops_the_unacted_cases_and_labels_itself():
     assert any("per-protocol" in w.lower() for w in board.warnings)
 
 
-def test_the_two_bases_disagree_on_the_seeded_batch(conn):
-    """Not a hypothetical: the flow resolves a minority of A4's cases, so the choice
-    of basis changes the sign of the headline. A scoreboard that offered only one of
-    them would be making that choice invisibly."""
+def test_the_two_bases_now_agree_because_every_in_scope_case_resolves(conn):
+    """This assertion is inverted from what it used to be, and the inversion is the
+    point. It previously pinned a defect: the flow resolved a minority of A4's cases,
+    the rest scored zero, and the choice of basis changed the *sign* of the headline.
+    The natural-recovery floor in ``sim.outcomes`` gives every randomised in-scope
+    case an outcome, so per-protocol has nothing left to drop and the two bases
+    coincide.
+
+    That is the healthy state, and it must not be mistaken for the basis distinction
+    being pointless -- see the next test, which resolves only part of a batch and
+    watches them separate again.
+    """
     resolved = _seeded(conn, n=200)
     itt = sb.build_scoreboard(resolved, resamples=DEMO_RESAMPLES)
     per_protocol = sb.build_scoreboard(
         resolved, basis=sb.Basis.RESOLVED_ONLY, resamples=DEMO_RESAMPLES
     )
-    assert itt.headline.estimate.point != per_protocol.headline.estimate.point
-    assert itt.arms[Arm.A4].case_count > per_protocol.arms[Arm.A4].case_count
+    assert itt.headline.estimate.point == per_protocol.headline.estimate.point
+    assert itt.arms[Arm.A4].case_count == per_protocol.arms[Arm.A4].case_count
+    for arm in sb.SCOREBOARD_ARMS:
+        assert itt.arms[arm].case_count == itt.arms[arm].resolved_case_count
+
+
+def test_the_bases_separate_again_when_part_of_a_batch_is_unresolved(conn):
+    """The per-protocol path stays honest-but-tested: drop an arm's outcomes and the
+    denominators diverge, the point estimates diverge with them, and the caveat
+    naming the bias still fires."""
+    batch = _batch({Arm.A0: (40, 10), Arm.A1: (40, 14), Arm.A4: (40, 30)}) + [
+        _out(f"case_unresolved{i:03d}", Arm.A4, rupees=9000, simulated=False)
+        for i in range(40)
+    ]
+    itt = sb.build_scoreboard(batch, resamples=DEMO_RESAMPLES)
+    per_protocol = sb.build_scoreboard(
+        batch, basis=sb.Basis.RESOLVED_ONLY, resamples=DEMO_RESAMPLES
+    )
+    assert itt.arms[Arm.A4].case_count == 80
+    assert per_protocol.arms[Arm.A4].case_count == 40
+    assert itt.headline.estimate.point < per_protocol.headline.estimate.point
+    assert any("per-protocol" in w.lower() for w in per_protocol.warnings)
+    assert any("intent-to-treat" in w.lower() for w in itt.warnings)
 
 
 def test_an_arm_below_the_inference_floor_is_flagged_by_name(conn):

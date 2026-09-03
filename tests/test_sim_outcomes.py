@@ -259,26 +259,38 @@ def test_the_simulated_baseline_action_never_reaches_the_outbox(
 # ------------------------------------------------------------ A4: the agent
 
 
-def test_the_agent_arm_resolves_only_cases_that_reached_scheduled(
+def test_only_a_case_that_reached_scheduled_earns_the_targeted_uplift(
     conn, make_obligation, make_case
 ):
+    """An A4 case the agent never acted on is still *in* the experiment, so it gets
+    the natural floor -- but it must not get the TARGETED lane, because no action
+    was taken to credit. The distinction between "resolved" and "acted on" is the
+    whole reason the two lanes exist."""
     case = _open(
         conn, make_obligation, make_case, case_id="case_0021", arm=Arm.A4,
         canonical_decline_class=DeclineClass.INSUFFICIENT_FUNDS,
     )
     still_detected = outcomes.resolve_case(conn, case.case_id)
-    assert still_detected.lane is outcomes.SimLane.NOT_SIMULATED
-    assert still_detected.probability is None
-    assert ledger.get_case(conn, case.case_id).state is CaseState.DETECTED
+    assert still_detected.lane is outcomes.SimLane.NATURAL_FLOOR
+    assert still_detected.lane is not outcomes.SimLane.TARGETED_AGENT
+    assert still_detected.action_type is None
+    assert still_detected.probability == anchors.natural_probability(
+        DeclineClass.INSUFFICIENT_FUNDS, None
+    )
 
 
-def test_a_case_parked_for_human_approval_is_left_parked(
+def test_a_parked_approval_case_is_never_auto_approved(
     conn, make_obligation, make_case, make_debit_envelope
 ):
-    """§14.2: T2 means a human approves. Resolving a parked case would be the
-    simulator granting that approval on the human's behalf."""
+    """§14.2: T2 means a human approves. The parked case now gets a natural-recovery
+    floor (it is still in the experiment and natural recovery did not stop), but the
+    property that matters is unchanged and is what this test pins: it must never
+    reach ``SCHEDULED``. ``awaiting_approval -> scheduled`` is the *approve* edge,
+    and a simulator taking it would be signing off on the human's behalf.
+    """
+    case_id = _case_id_with_draw(lambda d: d > Decimal("0.98"), Arm.A4)
     case = _open(
-        conn, make_obligation, make_case, case_id="case_0022", arm=Arm.A4,
+        conn, make_obligation, make_case, case_id=case_id, arm=Arm.A4,
         canonical_decline_class=DeclineClass.INSUFFICIENT_FUNDS,
     )
     case_machine.transition(conn, case.case_id, CaseState.DIAGNOSING)
@@ -286,10 +298,15 @@ def test_a_case_parked_for_human_approval_is_left_parked(
     case_machine.transition(conn, case.case_id, CaseState.AWAITING_APPROVAL)
 
     result = outcomes.resolve_case(conn, case.case_id)
-    assert result.lane is outcomes.SimLane.NOT_SIMULATED
+    assert result.lane is outcomes.SimLane.NATURAL_FLOOR
     assert "approval" in result.reason
+    assert result.action_type is None
+    assert result.final_state is not CaseState.SCHEDULED
+    # This draw does not recover, so the case is left exactly where the human left it.
     assert ledger.get_case(conn, case.case_id).state is CaseState.AWAITING_APPROVAL
-    assert _sim_rows(conn, case.case_id) == []
+    assert conn.execute(
+        sa.select(sa.func.count()).select_from(outbox_table)
+    ).scalar_one() == 0
 
 
 def test_a_debit_retry_against_a_dead_mandate_recovers_nothing_and_stops_hard(
@@ -606,18 +623,18 @@ def test_the_simulator_does_not_reach_back_into_the_agent():
                 pytest.fail(f"{path.name} imports {module}")
 
 
-def test_the_tally_reports_the_at_risk_it_actually_simulated(conn):
-    """The trap this closes, measured on the seeded batch: A0 and A1 get a draw for
-    100% of their cases, but A4 only resolves the ones the policy engine
-    auto-allowed -- the rest escalated, were denied, or are parked for approval.
-    Dividing A4's recovered rupees by *all* of A4's at-risk rupees therefore
-    compares a fully-resolved arm against a partly-resolved one and reads as though
-    the agent lost money it never got to act on.
+def test_the_two_denominators_now_agree_for_every_arm_that_is_scored(conn):
+    """This test used to assert the *defect*: A4 resolved a minority of its own
+    cases, so its recovered rupees were divided by a denominator covering cases it
+    never got a number for, and the all-cases rate read as though the agent had
+    lost money it never touched. The natural-recovery floor closes that gap -- every
+    in-scope case now resolves -- and this is where that is pinned. If a future
+    change reintroduces an unresolved in-scope case, the equality below fails, and
+    it should: the two rates would silently diverge again.
 
-    So the tally carries both denominators and names them. ``simulated_at_risk`` is
-    the only one on which the arms are comparable; it is also small enough for A4
-    that the comparison is not yet worth much, which is exactly what a caller needs
-    to see rather than infer.
+    ``simulated_at_risk`` stays on the tally rather than being deleted, because it
+    is still the honest denominator for an arm that is *not* scored: A2/A3/A5 have
+    cases and no outcomes at all.
     """
     cases = seed.generate(conn, n=200)
     flow.run(conn, cases)
@@ -632,12 +649,18 @@ def test_the_tally_reports_the_at_risk_it_actually_simulated(conn):
         assert tally.simulated_at_risk <= tally.total_at_risk
         assert tally.gross_recovered <= tally.simulated_at_risk
 
-    control, agent = resolution.by_arm[Arm.A0], resolution.by_arm[Arm.A4]
-    assert control.simulated_at_risk == control.total_at_risk
-    # The defect itself, asserted so it cannot quietly disappear: A4 resolves a
-    # minority of its own cases, so its all-cases rate is not a comparable number.
-    assert agent.simulated_at_risk < agent.total_at_risk
-    assert agent.gross_recovered_per_simulated_rupee > agent.gross_recovered_per_rupee_at_risk
+    for arm in outcomes.IN_SCOPE_ARMS:
+        tally = resolution.by_arm[arm]
+        assert tally.simulated_case_count == tally.case_count, arm
+        assert tally.simulated_at_risk == tally.total_at_risk, arm
+        assert (
+            tally.gross_recovered_per_simulated_rupee
+            == tally.gross_recovered_per_rupee_at_risk
+        ), arm
+
+    for arm in (Arm.A2, Arm.A3, Arm.A5):
+        tally = resolution.by_arm[arm]
+        assert tally.simulated_at_risk < tally.total_at_risk, arm
 
 
 def test_an_arm_that_resolved_nothing_has_no_simulated_rate_rather_than_zero(conn):
@@ -652,3 +675,170 @@ def test_an_arm_that_resolved_nothing_has_no_simulated_rate_rather_than_zero(con
         assert tally.simulated_case_count == 0
         assert tally.simulated_at_risk == Money.zero()
         assert tally.gross_recovered_per_simulated_rupee is None
+
+
+# ------------------------------------------- the natural-recovery floor (ITT)
+
+
+def test_a_case_the_agent_never_acted_on_still_gets_its_natural_recovery_floor(
+    conn, make_obligation, make_case
+):
+    """The defect this closes: an A4 case that escalated, was denied, or is parked
+    for approval used to resolve to *nothing*, and the intent-to-treat estimator
+    then scored it as zero recovered. Natural recovery does not switch off because
+    the agent declined to act -- zero is the wrong floor, and it understates the
+    treatment arm by exactly the money those cases would have collected on their
+    own. The honest floor is the same natural probability arm A0 gets.
+    """
+    case = _open(
+        conn, make_obligation, make_case, case_id="case_0501", arm=Arm.A4,
+        canonical_decline_class=DeclineClass.INSUFFICIENT_FUNDS,
+    )
+    case_machine.transition(conn, case.case_id, CaseState.DIAGNOSING)
+    case_machine.transition(conn, case.case_id, CaseState.ESCALATED)
+
+    result = outcomes.resolve_case(conn, case.case_id)
+    assert result.lane is outcomes.SimLane.NATURAL_FLOOR
+    assert result.was_simulated is True
+    assert result.probability == anchors.natural_probability(
+        DeclineClass.INSUFFICIENT_FUNDS, None
+    )
+
+
+def test_the_natural_floor_credits_no_action_because_none_was_taken(
+    conn, make_obligation, make_case
+):
+    """It is a *floor*, not a consolation prize: no uplift, no contact, no verb.
+    Crediting an escalated case with A4's targeted uplift would pay the agent for
+    work a human has not done yet."""
+    case = _open(
+        conn, make_obligation, make_case, case_id="case_0502", arm=Arm.A4,
+        canonical_decline_class=DeclineClass.INSUFFICIENT_FUNDS,
+    )
+    case_machine.transition(conn, case.case_id, CaseState.DIAGNOSING)
+    case_machine.transition(conn, case.case_id, CaseState.ESCALATED)
+
+    result = outcomes.resolve_case(conn, case.case_id)
+    nsf = DeclineClass.INSUFFICIENT_FUNDS
+    assert result.action_type is None
+    assert result.simulated_contacts == 0
+    assert result.probability < anchors.generic_probability(nsf, None)
+    assert result.probability < anchors.targeted_probability(
+        nsf, None, ActionType.SCHEDULE_DEBIT
+    )
+
+
+def test_a_parked_approval_case_that_self_heals_is_stopped_as_already_paid(
+    conn, make_obligation, make_case
+):
+    """The payer paid while the human was still deciding. The case must NOT end in
+    ``SCHEDULED`` -- that would be the simulator granting the T2 approval §14.2
+    reserves for a person. ``STOPPED(already_paid)`` is what actually happened."""
+    case_id = _case_id_with_draw(lambda d: d < Decimal("0.02"), Arm.A4)
+    case = _open(
+        conn, make_obligation, make_case, case_id=case_id, arm=Arm.A4,
+        canonical_decline_class=DeclineClass.INSUFFICIENT_FUNDS,
+    )
+    case_machine.transition(conn, case.case_id, CaseState.DIAGNOSING)
+    case_machine.transition(conn, case.case_id, CaseState.PLANNED)
+    case_machine.transition(conn, case.case_id, CaseState.AWAITING_APPROVAL)
+
+    result = outcomes.resolve_case(conn, case.case_id)
+    assert result.lane is outcomes.SimLane.NATURAL_FLOOR
+    assert result.recovered is True
+    stored = ledger.get_case(conn, case.case_id)
+    assert stored.state is CaseState.STOPPED
+    assert stored.stop_reason is StopReason.ALREADY_PAID
+
+
+def test_an_escalated_case_that_self_heals_reaches_recovered(
+    conn, make_obligation, make_case
+):
+    """§9.1 does have ``ESCALATED -> RECOVERED``, so unlike the A0 compromise this
+    one needs no workaround: the state and the money agree."""
+    case_id = _case_id_with_draw(lambda d: d < Decimal("0.02"), Arm.A4)
+    case = _open(
+        conn, make_obligation, make_case, case_id=case_id, arm=Arm.A4,
+        canonical_decline_class=DeclineClass.INSUFFICIENT_FUNDS,
+    )
+    case_machine.transition(conn, case.case_id, CaseState.DIAGNOSING)
+    case_machine.transition(conn, case.case_id, CaseState.ESCALATED)
+
+    result = outcomes.resolve_case(conn, case.case_id)
+    assert result.recovered is True
+    assert result.final_state is CaseState.RECOVERED
+    assert ledger.get_case(conn, case.case_id).state is CaseState.RECOVERED
+
+
+def test_a_policy_denied_case_is_terminal_so_the_amount_rides_on_the_outcome(
+    conn, make_obligation, make_case
+):
+    """``STOPPED`` has no outgoing edges by construction. A denied case that later
+    self-heals therefore cannot be moved, and the recovered amount lives on the
+    ``SimulatedOutcome`` -- the same compromise A0 carries, for the same reason."""
+    case_id = _case_id_with_draw(lambda d: d < Decimal("0.02"), Arm.A4)
+    case = _open(
+        conn, make_obligation, make_case, case_id=case_id, arm=Arm.A4,
+        canonical_decline_class=DeclineClass.INSUFFICIENT_FUNDS,
+    )
+    case_machine.transition(
+        conn, case.case_id, CaseState.STOPPED,
+        stop_reason=StopReason.POLICY_BLOCKED, stopped_at=case.detected_at,
+    )
+    result = outcomes.resolve_case(conn, case.case_id)
+    assert result.lane is outcomes.SimLane.NATURAL_FLOOR
+    assert result.recovered is True
+    assert result.recovered_amount == case.amount_at_risk
+    assert result.final_state is CaseState.STOPPED
+    assert ledger.get_case(conn, case.case_id).stop_reason is StopReason.POLICY_BLOCKED
+
+
+def test_every_in_scope_case_is_resolved_exactly_once_on_a_seeded_batch(conn):
+    """The property the whole ITT estimator rests on: no case in A0/A1/A4 comes back
+    unresolved, and none is resolved twice."""
+    cases = seed.generate(conn, n=200)
+    flow.run(conn, cases)
+    resolution = outcomes.resolve_batch(conn, cases)
+
+    in_scope = [o for o in resolution.outcomes if o.arm in outcomes.IN_SCOPE_ARMS]
+    assert in_scope, "the seeded batch put no case in A0/A1/A4"
+    assert all(o.was_simulated for o in in_scope)
+    assert all(
+        o.lane is outcomes.SimLane.NOT_SIMULATED
+        for o in resolution.outcomes
+        if o.arm not in outcomes.IN_SCOPE_ARMS
+    )
+    assert len(_sim_rows(conn)) == len(in_scope)
+
+
+def test_an_out_of_scope_arm_gets_no_floor_either(conn, make_obligation, make_case):
+    """A2/A3/A5 are not scored, so giving them a natural floor would manufacture a
+    number for an arm nobody built (§18.4)."""
+    case = _open(
+        conn, make_obligation, make_case, case_id="case_0503", arm=Arm.A3,
+        canonical_decline_class=DeclineClass.INSUFFICIENT_FUNDS,
+    )
+    result = outcomes.resolve_case(conn, case.case_id)
+    assert result.lane is outcomes.SimLane.NOT_SIMULATED
+    assert result.probability is None
+
+
+def test_a_second_pass_is_recognised_from_the_audit_log_not_from_the_state(
+    conn, make_obligation, make_case
+):
+    """Idempotency used to be a side effect of the entry-state check, which the
+    natural floor breaks: a resolved-and-stopped case is no longer in any entry
+    state, but it *is* still in an arm, so a state-only check would hand it a second
+    draw. The ``simulated_psp_response`` row is the authoritative record that a case
+    has been resolved, so that is what gets checked."""
+    case = _open(
+        conn, make_obligation, make_case, case_id="case_0504", arm=Arm.A0,
+        canonical_decline_class=DeclineClass.INSUFFICIENT_FUNDS,
+    )
+    first = outcomes.resolve_case(conn, case.case_id)
+    assert first.was_simulated is True
+
+    second = outcomes.resolve_case(conn, case.case_id)
+    assert second.lane is outcomes.SimLane.NOT_SIMULATED
+    assert "already" in second.reason
+    assert len(_sim_rows(conn, case.case_id)) == 1

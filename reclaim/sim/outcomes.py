@@ -7,30 +7,48 @@ state machine to the state that outcome implies, and writes one audit row that s
 the simulated environment, not of any real portfolio -- see
 ``anchors.ANCHOR_HONESTY_NOTE``, which is the sentence that belongs on the slide.
 
-The three lanes, and why they are not symmetric
------------------------------------------------
-============  =====  ===============  ==================================================
-Lane          Arm    Entry state      What is simulated
-============  =====  ===============  ==================================================
-NATURAL_ONLY  A0     ``detected``     Natural recovery only: no diagnosis, no policy
-                                      evaluation, no action, no contact. §12.2's floor.
-GENERIC       A1     ``detected``     One undifferentiated static 4-touch drip that
-                                      never reads the decline code, with a modest flat
-                                      uplift. §12.2's "realistic industry baseline".
-TARGETED      A4     ``scheduled``    The action the agent actually enqueued, with an
-                                      uplift that depends on whether that verb is the
-                                      one §9.2 prescribes for the observed class.
-============  =====  ===============  ==================================================
+The four lanes, and why they are not symmetric
+----------------------------------------------
+=============  =====  ===============  =================================================
+Lane           Arm    Entry state      What is simulated
+=============  =====  ===============  =================================================
+NATURAL_ONLY   A0     ``detected``     Natural recovery only: no diagnosis, no policy
+                                       evaluation, no action, no contact. §12.2's floor.
+GENERIC        A1     ``detected``     One undifferentiated static 4-touch drip that
+                                       never reads the decline code, with a modest flat
+                                       uplift. §12.2's "realistic industry baseline".
+TARGETED       A4     ``scheduled``    The action the agent actually enqueued, with an
+                                       uplift that depends on whether that verb is the
+                                       one §9.2 prescribes for the observed class.
+NATURAL_FLOOR  any    anything else    An in-scope case the agent did **not** act on:
+               in                      escalated below the confidence floor, stopped by
+               scope                   policy, or parked for a T2 approval. Natural
+                                       recovery only -- no uplift, no verb, no contact.
+=============  =====  ===============  =================================================
 
-Everything else comes back ``NOT_SIMULATED`` with a reason. That includes A2, A3 and
-A5 (cut at T-12h per §18.4, plus A3 by this pass's own scope decision) and -- the one
-that matters most -- **any A4 case parked in ``awaiting_approval``**. §14.2 says a T2
-action waits for a human; a simulator that resolved those cases would be granting
-that approval on the human's behalf and inflating A4 with money no human ever
-released. Parked cases stay parked. That is an honest demo state, not a gap.
+**Why the floor exists, and what it fixes.** Every case is randomised into an arm at
+creation and §12.1's unit is that case, so an intent-to-treat estimate keeps it in the
+denominator whatever the agent later decided. Before this lane, such a case resolved to
+*nothing* and the estimator scored it as **zero recovered** -- which asserts that a case
+recovers no money at all because the agent declined to act on it. That is false: natural
+recovery does not switch off. Zero was the wrong floor, and on the seeded batch it
+understated A4 by about two thirds of its recovered rupees and flipped the sign of the
+headline. The right floor is the same natural probability arm A0 gets, and no more --
+crediting an escalated case with A4's *targeted* uplift would pay the agent for work a
+human has not done yet.
 
-Three deliberate compromises, each of which changes how a number here reads
---------------------------------------------------------------------------
+Only A2/A3/A5 come back ``NOT_SIMULATED`` now (cut at T-12h per §18.4, plus A3 by this
+pass's own scope decision), along with any case a previous pass already resolved.
+Giving an unscored arm a floor would manufacture a number for an arm nobody built.
+
+**A parked case is still never auto-approved.** It gets the floor, because natural
+recovery ran while the human was deciding -- but ``awaiting_approval -> scheduled`` is
+the *approve* edge and the simulator never takes it. A parked case that self-heals ends
+``STOPPED(already_paid)``; a parked case that does not is left exactly where the human
+left it.
+
+Four deliberate compromises, each of which changes how a number here reads
+-------------------------------------------------------------------------
 1. **A0 recovery is recorded as ``STOPPED(already_paid)``, not ``RECOVERED``.**
    §9.1 has no edge from ``detected`` to ``recovered``: every path into ``recovered``
    runs through ``executing`` or a reconciliation, and both mean somebody acted.
@@ -55,6 +73,13 @@ Three deliberate compromises, each of which changes how a number here reads
    the seeded data assigns cases to. **The A4-minus-A3 decomposition -- the value of
    the LLM, which §12.2 says must be measured and not asserted -- is not computed
    here and cannot be, with A3 out of scope.**
+4. **The natural floor is applied uniformly, including to policy-denied cases.** A
+   case denied because of an open dispute or a withdrawn consent probably does *not*
+   self-heal at the population rate -- an open dispute is itself evidence the money is
+   contested. There is no model for that, so the floor uses the same natural anchor as
+   everything else, which mildly over-credits the denied slice. Zero would be worse by
+   far, and the alternative (a per-stop-reason floor) would be a fourth table of
+   numbers with no more evidence behind it than this one.
 
 Determinism
 -----------
@@ -103,7 +128,7 @@ from reclaim.sim.anchors import (
     targeted_probability,
 )
 from reclaim.spine import audit_store, case_machine, ledger
-from reclaim.spine.tables import outbox as outbox_table
+from reclaim.spine.tables import audit_log, outbox as outbox_table
 
 __all__ = [
     "ArmTally",
@@ -149,6 +174,7 @@ class SimLane(StrEnum):
     NATURAL_ONLY = "natural_only"
     GENERIC_BASELINE = "generic_baseline"
     TARGETED_AGENT = "targeted_agent"
+    NATURAL_FLOOR = "natural_floor"
     NOT_SIMULATED = "not_simulated"
 
 
@@ -286,13 +312,37 @@ def draw_for(case_id: str, arm: Arm, *, salt: str = SIM_SALT) -> Decimal:
 # ---------------------------------------------------------------------------
 
 
-def _lane_for(case: RiskCase) -> tuple[SimLane, str]:
-    """Which lane a case belongs to, or why it gets none.
+def _already_resolved(conn: Connection, case_id: str) -> bool:
+    """Whether this case already carries a ``simulated_psp_response`` row.
 
-    The entry-state check is what makes ``resolve_batch`` safe to call twice: a case
-    already resolved is no longer in its lane's entry state, so the second pass
-    reports it as not-simulated instead of attempting an illegal transition.
+    This -- not the case's state -- is what makes ``resolve_batch`` idempotent.
+    State was load-bearing for that before the natural floor existed, and it was
+    already leaking: an A0 case that did *not* recover stays in ``detected``, so a
+    second pass re-drew it and wrote a second row. Now that every in-scope case
+    resolves, a state-only check would re-draw every non-recovered case in the
+    book. The audit row is the authoritative record that a case has been resolved,
+    so the audit row is what gets asked.
     """
+    found = conn.execute(
+        sa.select(audit_log.c.sequence)
+        .where(
+            audit_log.c.case_id == case_id,
+            audit_log.c.event_type == SIMULATED_RESPONSE_EVENT,
+        )
+        .limit(1)
+    ).first()
+    return found is not None
+
+
+def _lane_for(conn: Connection, case: RiskCase) -> tuple[SimLane, str]:
+    """Which lane a case belongs to, or why it gets none."""
+    if _already_resolved(conn, case.case_id):
+        return (
+            SimLane.NOT_SIMULATED,
+            "the case already carries a simulated_psp_response row: it was "
+            "resolved by an earlier pass and a second draw would double-count it",
+        )
+
     if case.arm not in IN_SCOPE_ARMS:
         return (
             SimLane.NOT_SIMULATED,
@@ -300,29 +350,45 @@ def _lane_for(case: RiskCase) -> tuple[SimLane, str]:
             f"(§18.4) keeps A0/A1/A4, and A3 was dropped with them",
         )
 
-    if case.arm is Arm.A4:
-        if case.state is CaseState.SCHEDULED:
-            return SimLane.TARGETED_AGENT, ""
-        if case.state is CaseState.AWAITING_APPROVAL:
-            return (
-                SimLane.NOT_SIMULATED,
-                "the case is parked awaiting human approval (§14.2 T2); the "
-                "simulator does not grant approvals, so it stays parked",
-            )
+    if case.arm is Arm.A0:
         return (
-            SimLane.NOT_SIMULATED,
-            f"arm A4 case is in {case.state.value}, not scheduled: no action was "
-            "taken, so there is no PSP response to simulate",
+            (SimLane.NATURAL_ONLY, "")
+            if case.state is CaseState.DETECTED
+            else (
+                SimLane.NATURAL_FLOOR,
+                f"control-arm case is in {case.state.value} rather than detected; "
+                "something moved it, so only the natural floor applies",
+            )
         )
 
-    lane = SimLane.NATURAL_ONLY if case.arm is Arm.A0 else SimLane.GENERIC_BASELINE
-    if case.state is not CaseState.DETECTED:
+    if case.arm is Arm.A1:
         return (
-            SimLane.NOT_SIMULATED,
-            f"arm {case.arm.value} case is in {case.state.value}, not detected: "
-            "either it was already resolved or something else moved it",
+            (SimLane.GENERIC_BASELINE, "")
+            if case.state is CaseState.DETECTED
+            else (
+                SimLane.NATURAL_FLOOR,
+                f"baseline-arm case is in {case.state.value} rather than detected, "
+                "so the drip was never simulated for it",
+            )
         )
-    return lane, ""
+
+    if case.state is CaseState.SCHEDULED:
+        return SimLane.TARGETED_AGENT, ""
+
+    # An A4 case the agent did not act on. It is still in the experiment, and
+    # natural recovery did not stop because we declined to act -- see the module
+    # docstring, compromise 4.
+    if case.state is CaseState.AWAITING_APPROVAL:
+        return (
+            SimLane.NATURAL_FLOOR,
+            "the case is parked awaiting human approval (§14.2 T2); the simulator "
+            "does not grant approvals, so only the natural floor applies",
+        )
+    return (
+        SimLane.NATURAL_FLOOR,
+        f"arm A4 case is in {case.state.value}, not scheduled: no action was taken, "
+        "so only the natural floor applies",
+    )
 
 
 def _enqueued_verb(conn: Connection, case_id: str) -> ActionType | None:
@@ -392,14 +458,14 @@ def resolve_case(
     if case is None:
         raise ValueError(f"no case {case_id!r} in the ledger")
 
-    lane, why = _lane_for(case)
+    lane, why = _lane_for(conn, case)
     if lane is SimLane.NOT_SIMULATED:
         return _not_simulated(case, why)
 
     verb = _enqueued_verb(conn, case_id) if lane is SimLane.TARGETED_AGENT else None
     decline_class, risk_class = case.canonical_decline_class, case.risk_class
 
-    if lane is SimLane.NATURAL_ONLY:
+    if lane in (SimLane.NATURAL_ONLY, SimLane.NATURAL_FLOOR):
         chance = natural_probability(decline_class, risk_class)
         contacts = 0
     elif lane is SimLane.GENERIC_BASELINE:
@@ -469,11 +535,64 @@ def resolve_case(
         draw=draw,
         simulated_contacts=contacts,
         reason=(
-            "recovered inside the window"
-            if recovered
-            else "not recovered inside the window"
+            ("recovered inside the window" if recovered else "not recovered inside the window")
+            + (f"; natural floor only -- {why}" if lane is SimLane.NATURAL_FLOOR else "")
         ),
     )
+
+
+def _record_self_heal(
+    conn: Connection, case: RiskCase, lane: SimLane, at
+) -> CaseState:
+    """Move a case that recovered with no action from us, as far as §9.1 permits.
+
+    Three outcomes, in preference order, decided by asking the *frozen* transition
+    table rather than by a list kept here:
+
+    ``RECOVERED``  when the edge exists -- only ``escalated`` has one among the
+                   states a floor case can be in, and there the state and the money
+                   agree with no workaround needed.
+    ``STOPPED(already_paid)``  when it does not. ``detected`` and
+                   ``awaiting_approval`` land here. For a parked case this is the
+                   *only* honest destination: ``awaiting_approval -> scheduled`` is
+                   the approve edge, and taking it would be the simulator granting
+                   the T2 sign-off §14.2 reserves for a person.
+    no move        when the case is already terminal. ``stopped`` has no outgoing
+                   edges by construction, so a policy-denied case that later
+                   self-heals cannot be moved at all and the amount rides on the
+                   ``SimulatedOutcome`` -- compromise 1, reached by a second route.
+
+    The cost of the middle case is that ``STOPPED(already_paid)`` is doing double
+    duty: it means both "we never acted and the money arrived" and "we stopped and
+    then the money arrived". Only the lane on the audit row tells them apart.
+    """
+    origin = (
+        "control arm (A0) recovered naturally with no action from us"
+        if lane is SimLane.NATURAL_ONLY
+        else f"recovered naturally from {case.state.value} with no action from us"
+    )
+
+    if case.can_transition_to(CaseState.RECOVERED):
+        return case_machine.transition(
+            conn, case.case_id, CaseState.RECOVERED,
+            actor=ActorType.SYSTEM, at=at, event_type="case_recovered",
+            rationale=f"simulated: {origin}",
+        ).state
+
+    if case.can_transition_to(CaseState.STOPPED):
+        return case_machine.transition(
+            conn, case.case_id, CaseState.STOPPED,
+            actor=ActorType.SYSTEM, at=at, event_type="case_stopped",
+            rationale=(
+                f"simulated: {origin}; §9.1 offers no "
+                f"{case.state.value}->recovered edge, so this is recorded as "
+                "already_paid and the amount is carried on the SimulatedOutcome"
+            ),
+            stop_reason=StopReason.ALREADY_PAID, stopped_at=at,
+        ).state
+
+    # Terminal already. Nothing to move; the money is on the outcome.
+    return case.state
 
 
 def _apply(
@@ -492,24 +611,13 @@ def _apply(
     """
     stamp = "simulated outcome at the close of the recovery window (sim.anchors)"
 
-    if lane is SimLane.NATURAL_ONLY:
+    if lane in (SimLane.NATURAL_ONLY, SimLane.NATURAL_FLOOR):
         if not recovered:
             # Nothing happened, so nothing moves. §9.1 has no "window expired
             # unrecovered" terminal and no StopReason for one, so inventing a stop
             # here would put a reason on the row that is not true.
             return case.state
-        # See compromise 1: detected -> recovered is not an edge, and already_paid
-        # is exactly what a self-healed control case is.
-        return case_machine.transition(
-            conn, case.case_id, CaseState.STOPPED,
-            actor=ActorType.SYSTEM, at=at, event_type="case_stopped",
-            rationale=(
-                "control arm (A0) recovered naturally with no action from us; "
-                "§9.1 has no detected->recovered edge, so this is recorded as "
-                "already_paid and the amount is carried on the SimulatedOutcome"
-            ),
-            stop_reason=StopReason.ALREADY_PAID, stopped_at=at,
-        ).state
+        return _record_self_heal(conn, case, lane, at)
 
     if lane is SimLane.GENERIC_BASELINE:
         case_machine.transition(
