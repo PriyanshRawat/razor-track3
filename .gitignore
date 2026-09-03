@@ -7,3 +7,6 @@ build/
 dist/
 .venv/
 venv/
+
+# agent worktrees (isolated clones, never part of the tree)
+.claude/worktrees/
