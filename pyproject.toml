@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "reclaim"
+version = "0.1.0"
+description = "RECLAIM -- AI revenue-recovery agent (Track 03). Phase 0: frozen contracts; Phase 1: core spine."
+requires-python = ">=3.11"
+dependencies = ["pydantic>=2.7", "sqlalchemy>=2.0"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[tool.setuptools.packages.find]
+include = ["reclaim*"]
+
+[tool.pytest.ini_options]
+# Without this, `pytest` and `python -m pytest` disagree: only the latter puts the
+# repository root on sys.path, so a judge running the bare command gets six
+# collection errors on a green tree. §12.5 promises reproducibility; that promise
+# includes the test command.
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-q"
