@@ -19,7 +19,6 @@ executor's job in a later step, not the queue's.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 
 import pytest
 from sqlalchemy.exc import IntegrityError

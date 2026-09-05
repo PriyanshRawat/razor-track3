@@ -56,7 +56,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from reclaim.contracts.enums import Arm
 from reclaim.contracts.money import Money, money_sum
 from reclaim.contracts.strata import StratumKey
-from reclaim.contracts.units import MONEY_RATIO_SCALE, PValue, Ratio, ratio
+from reclaim.contracts.units import PValue, Ratio, ratio
 from reclaim.contracts.versions import METRICS_VERSION
 
 try:  # pragma: no cover - 3.11+

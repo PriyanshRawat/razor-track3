@@ -63,7 +63,7 @@ vocabulary is open. See CONTRACTS.md.
 
 from __future__ import annotations
 
-from typing import Any, Final, Iterable, Sequence
+from typing import Any, Final, Sequence
 
 from pydantic import (
     BaseModel,

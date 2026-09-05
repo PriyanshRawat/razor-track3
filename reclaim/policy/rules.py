@@ -40,7 +40,7 @@ number we chose, not a card-scheme limit we can cite, and it is named as such.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Final, Mapping, Sequence
+from typing import Final, Mapping
 
 from reclaim.contracts.actions import ACTION_SPECS, ActionType
 from reclaim.contracts.enums import AutonomyTier, PolicyCategory, PolicyEffect

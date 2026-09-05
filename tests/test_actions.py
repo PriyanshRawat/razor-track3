@@ -9,7 +9,6 @@ exist. These tests pin that property rather than merely exercising the models.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
 
 import pytest
 from pydantic import BaseModel, ValidationError

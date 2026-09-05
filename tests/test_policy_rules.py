@@ -25,7 +25,6 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-import pytest
 
 from reclaim.contracts.actions import (
     ACTION_SPECS,

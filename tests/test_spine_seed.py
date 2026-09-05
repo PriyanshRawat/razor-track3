@@ -24,18 +24,13 @@ from reclaim.contracts.enums import (
     CaseState,
     ObligationKind,
     RiskClass,
-    Segment,
 )
 from reclaim.contracts.experiment import assign_arm
-from reclaim.contracts.money import Money
-from reclaim.contracts.strata import StratumKey, amount_band
+from reclaim.contracts.strata import amount_band
 from reclaim.spine import audit_store, ledger
 from reclaim.spine.errors import DuplicateActiveCase
 from reclaim.spine.seed import (
-    CASE_COUNT,
     SEED,
-    _AMOUNT_TIERS_RUPEES,
-    _SEGMENTS,
     generate,
     make_experiment_spec,
 )

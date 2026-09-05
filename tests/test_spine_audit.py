@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 
 import sqlalchemy as sa
 
-from reclaim.contracts.audit import GENESIS_HASH, AuditRow
+from reclaim.contracts.audit import GENESIS_HASH
 from reclaim.contracts.canonical import digest
 from reclaim.contracts.enums import ActorType
 from reclaim.spine import audit_store

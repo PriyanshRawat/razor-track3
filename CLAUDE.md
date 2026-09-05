@@ -4,15 +4,24 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this repository currently is
 
-RECLAIM — an AI revenue-recovery agent (hackathon Track 03). The repo is at **Phase 0: a
-contract freeze**. Everything under `reclaim/contracts/` is a Pydantic schema, an enum, or a
-pure function. There are no detectors, no policy rules, no planner, no prompts, no LLM calls,
-no persistence, no I/O, and no UI — that absence is deliberate and is enforced by tests.
+RECLAIM — an AI revenue-recovery agent (hackathon Track 03). **`README.md` is the
+submission-facing description; this file is the working guide.** The repo is Phase 0 (frozen
+contracts) plus Phase 1 (the spine, normalizer, diagnostician, policy engine, flow and
+simulator built on them), and `demo.py` runs the whole thing end to end.
 
-Phase 0 is code-complete and has been through an adversarial review that found and fixed
-**five defects in already-green code** (`CONTRACTS.md` §6). The freeze is **not signed off
-yet**: `versions.PHASE_0_FROZEN` is still `False` and awaits the user's decision on the §3
-questions (Q1/Q3/Q4 in particular).
+**Phase 0 — `reclaim/contracts/`.** Every module there is a Pydantic schema, an enum or a
+pure function. No detectors, no policy rules, no planner, no prompts, no LLM calls, no
+persistence, no I/O, no UI — that absence is deliberate and `tests/test_contract_hygiene.py`
+enforces it. The restriction is on `contracts/` alone; the rest of `reclaim/` has all of it.
+
+Phase 0 went through an adversarial review that found and fixed **five defects in
+already-green code** (`CONTRACTS.md` §6). The freeze is **not signed off yet**:
+`versions.PHASE_0_FROZEN` is still `False` and awaits the user's decision on the §3 questions
+(Q1/Q3/Q4 in particular).
+
+**Phase 1 — everything else under `reclaim/`.** There are still no LLM calls anywhere: the
+diagnostician is deterministic, which is why §12.2's A4−A3 comparison ("the value of the
+LLM") cannot be computed from this code and must not be claimed.
 
 Three documents govern the work, in this order of authority:
 
@@ -31,14 +40,20 @@ Three documents govern the work, in this order of authority:
 ```bash
 pip install -e ".[dev]"
 
-PYTHONIOENCODING=utf-8 python -m pytest                              # full suite (251 tests)
-PYTHONIOENCODING=utf-8 python -m pytest tests/test_experiment.py -q  # one file
-PYTHONIOENCODING=utf-8 python -m pytest tests/test_experiment.py::test_name -q
+python demo.py                              # seed -> agent -> sim -> scoreboard -> chain -> invariants
+python demo.py --cases 2000 --allocation planned
+python -m pytest                            # full suite (696 tests)
+python -m pytest tests/test_experiment.py -q
+python -m pytest tests/test_experiment.py::test_name -q
+python -m ruff check                        # clean; config in pyproject.toml
 ```
 
-**`PYTHONIOENCODING=utf-8` is not optional on this machine** (CONTRACTS.md Q9). Windows
-`cp1252` raises `UnicodeEncodeError` on `₹`, which `Money.__str__` emits; any command whose
-output can reach a `Money` repr will crash without it. Applies to `python -c` one-liners too.
+**`PYTHONIOENCODING=utf-8` is still required for ad-hoc one-liners** (CONTRACTS.md Q9):
+Windows `cp1252` raises `UnicodeEncodeError` on `₹`, which `Money.__str__` emits, so any
+`python -c` whose output reaches a `Money` repr crashes without it. It is **no longer needed
+for `pytest`** (output is captured) **or for `demo.py`**, which reconfigures its own stdout —
+requiring a judge to set an environment variable before the demo works was a crash for
+reasons unrelated to the work. Do not "simplify" `demo._force_utf8_stdout` away.
 
 `pyproject.toml` sets `pythonpath = ["."]` so bare `pytest` and `python -m pytest` agree —
 do not remove it; a judge running the bare command must not get collection errors.

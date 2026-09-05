@@ -77,6 +77,7 @@ from reclaim.spine.tables import (
 __all__ = [
     "CHECKS",
     "INVARIANT_TEXT",
+    "NO_ACTION_DECISION_EVENTS",
     "InvariantReport",
     "InvariantResult",
     "InvariantStatus",
@@ -253,6 +254,32 @@ HUMAN_TASK_PROXY_STATES: frozenset[CaseState] = frozenset(
 
 #: Outbox statuses that mean the action is still going to happen.
 _OPEN_OUTBOX_STATUSES: frozenset[str] = frozenset({"pending", "claimed"})
+
+#: Audit event types that record a deliberate decision *not* to act on a case.
+#:
+#: §9.1 forbids a case being **silently** orphaned, and the adverb is doing the
+#: work. Two populations sit in ``detected`` forever by design: A0, the no-action
+#: control (§12.2) -- moving it would contaminate the natural-recovery floor the
+#: whole estimate rests on -- and the arms §18.4's T-12h cut left unimplemented.
+#: ``sim.outcomes._apply`` deliberately refuses to close them, because §9.1 has no
+#: "window expired unrecovered" terminal and no ``StopReason`` that would be true.
+#:
+#: So the case has no next step, and that is correct. What makes it not *silent*
+#: is a row in the hash-chained audit log, written at decision time by a different
+#: component into a different table. That distinction is the whole justification:
+#: the ``HUMAN_TASK_PROXY_STATES`` exemption below is circular (the state is both
+#: the claim and its only evidence) and is therefore never allowed to produce a
+#: pass, whereas this evidence is independent of the state it excuses.
+#:
+#: It is still not a *next step*, so decision-closed cases are counted separately
+#: and never satisfy the invariant -- ``HOLDS`` continues to require at least one
+#: genuinely scheduled action. A live case with no queued action, no human owner
+#: and no logged decision is still ``VIOLATED``, which is the bug this check is
+#: for. A test walks every member against a real ``flow.run``: renaming one in
+#: ``flow`` must not silently widen the exemption.
+NO_ACTION_DECISION_EVENTS: frozenset[str] = frozenset(
+    {"control_arm_no_action", "arm_not_routed"}
+)
 
 
 def check_all(conn: Connection) -> InvariantReport:
@@ -511,8 +538,17 @@ def check_no_orphaned_live_case(conn: Connection) -> InvariantResult:
         ).all()
     )
 
+    decided = frozenset(
+        row.case_id
+        for row in conn.execute(
+            sa.select(audit_log.c.case_id)
+            .where(audit_log.c.event_type.in_(sorted(NO_ACTION_DECISION_EVENTS)))
+            .where(audit_log.c.case_id.isnot(None))
+        ).all()
+    )
+
     proxy_values = frozenset(state.value for state in HUMAN_TASK_PROXY_STATES)
-    scheduled, proxied, orphaned, over_scheduled = [], [], [], []
+    scheduled, proxied, closed, orphaned, over_scheduled = [], [], [], [], []
     for case in cases:
         queued = int(open_counts.get(case.case_id, 0))
         if queued == 1:
@@ -521,6 +557,8 @@ def check_no_orphaned_live_case(conn: Connection) -> InvariantResult:
             over_scheduled.append(case.case_id)
         elif case.state in proxy_values:
             proxied.append(case.case_id)
+        elif case.case_id in decided:
+            closed.append(case.case_id)
         else:
             orphaned.append(case.case_id)
 
@@ -538,11 +576,12 @@ def check_no_orphaned_live_case(conn: Connection) -> InvariantResult:
             offending_case_ids=tuple(sorted(orphaned + over_scheduled)),
             detail=(
                 f"{len(orphaned)} of {len(cases)} non-terminal case(s) are orphaned "
-                f"-- no open outbox row and no human-owned state -- and "
-                f"{len(over_scheduled)} carry more than one open action. Live states "
-                f"present: {by_state}. {len(proxied)} case(s) are counted as having "
-                "an open human task purely on their state, which is not independent "
-                "evidence."
+                f"-- no open outbox row, no human-owned state and no logged "
+                f"no-action decision -- and {len(over_scheduled)} carry more than "
+                f"one open action. Live states present: {by_state}. {len(proxied)} "
+                "case(s) are counted as having an open human task purely on their "
+                f"state, which is not independent evidence; {len(closed)} carry a "
+                "logged no-action decision, which is."
             ),
         )
 
@@ -555,9 +594,11 @@ def check_no_orphaned_live_case(conn: Connection) -> InvariantResult:
             detail=(
                 f"{len(cases)} non-terminal case(s), none of which has a queued "
                 f"action; {len(proxied)} are parked in a human-owned state "
-                f"({', '.join(sorted(proxy_values))}). There is no human-task table, "
-                "so that parking is the claim and its only evidence -- a pass here "
-                "would be circular."
+                f"({', '.join(sorted(proxy_values))}) and {len(closed)} carry a "
+                "logged no-action decision. There is no human-task table, so that "
+                "parking is the claim and its only evidence -- a pass here would be "
+                "circular -- and a logged decision explains a missing next step "
+                "rather than supplying one."
             ),
         )
 
@@ -568,10 +609,12 @@ def check_no_orphaned_live_case(conn: Connection) -> InvariantResult:
         candidates_examined=len(cases),
         detail=(
             f"{len(scheduled)} of {len(cases)} non-terminal case(s) have exactly one "
-            f"open outbox row; the other {len(proxied)} are parked in a human-owned "
-            "state, which is accepted on the state alone (no human-task table "
-            "exists) and is therefore not independent evidence. Live states: "
-            f"{by_state}."
+            f"open outbox row. Of the rest, {len(proxied)} are parked in a "
+            "human-owned state, which is accepted on the state alone (no human-task "
+            f"table exists) and is therefore not independent evidence, and "
+            f"{len(closed)} carry a logged no-action decision -- a control or "
+            "unimplemented arm, explained in the audit chain rather than silent. "
+            f"Neither group is a next step. Live states: {by_state}."
         ),
     )
 

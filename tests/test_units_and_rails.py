@@ -11,7 +11,7 @@ from reclaim.contracts.canonical import canonical_json
 from reclaim.contracts.enums import Rail
 from reclaim.contracts.money import Money
 from reclaim.contracts.rails import RAIL_SPECS, rail_spec
-from reclaim.contracts.units import PValue, Probability, Ratio, probability, ratio
+from reclaim.contracts.units import PValue, Probability, probability, ratio
 
 
 class _Holder(BaseModel):

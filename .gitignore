@@ -1,12 +1,48 @@
+# Python build + cache artefacts
 __pycache__/
 *.py[cod]
-.pytest_cache/
-.ruff_cache/
 *.egg-info/
 build/
 dist/
+.eggs/
+
+# Test / lint / type caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Virtual environments
 .venv/
 venv/
+env/
+ENV/
 
-# agent worktrees (isolated clones, never part of the tree)
-.claude/worktrees/
+# Databases the demo can be pointed at. `python -m reclaim.demo` defaults to an
+# in-memory SQLite database and writes nothing, but --database-url sqlite:///x.db
+# leaves a file behind, and a checked-in database would make the audit chain's
+# head hash look pinned when it is not.
+*.db
+*.sqlite
+*.sqlite3
+
+# Agent / assistant working files. None of this is the submission: settings.local
+# .json is per-machine tool permissions and worktrees/ holds throwaway clones.
+.claude/
+.agents/
+
+# Editors and OS noise
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Scratch
+scratch/
+scratchpad/
+*.log

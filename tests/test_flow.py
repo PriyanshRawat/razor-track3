@@ -32,7 +32,6 @@ from __future__ import annotations
 from datetime import timedelta
 from decimal import Decimal
 
-import pytest
 import sqlalchemy as sa
 
 from reclaim.contracts.actions import ActionType
@@ -51,7 +50,6 @@ from reclaim.contracts.enums import (
     RootCauseClass,
     StopReason,
 )
-from reclaim.contracts.money import Money
 from reclaim.contracts.obligations import Obligation, ObligationStatus
 from reclaim.contracts.policy_format import PolicyThresholds
 from reclaim.diagnosis.deterministic import diagnose

@@ -27,7 +27,7 @@ from __future__ import annotations
 import random
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Mapping, Sequence
+from typing import Mapping
 
 from sqlalchemy.engine import Connection
 
@@ -40,7 +40,6 @@ from reclaim.contracts.enums import (
     CaseState,
     ObligationKind,
     ObligationStatus,
-    Rail,
     RiskClass,
     Segment,
 )
@@ -52,7 +51,6 @@ from reclaim.contracts.experiment import (
 from reclaim.contracts.money import Money
 from reclaim.contracts.obligations import Obligation
 from reclaim.contracts.strata import StratumKey
-from reclaim.contracts.temporal import UtcDatetime
 from reclaim.spine import ledger
 
 __all__ = [

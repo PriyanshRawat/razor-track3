@@ -109,7 +109,7 @@ from reclaim.contracts.obligations import (
 from reclaim.contracts.policy_format import PolicyThresholds
 from reclaim.contracts.temporal import to_rfc3339
 from reclaim.diagnosis.deterministic import diagnose
-from reclaim.policy.engine import Evaluation, evaluate
+from reclaim.policy.engine import evaluate
 from reclaim.policy.facts import FactContext, build_facts, validate_facts
 from reclaim.policy.rules import (
     GOVERNED_ACTION_TYPES,

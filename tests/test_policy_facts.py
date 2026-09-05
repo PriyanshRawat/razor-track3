@@ -21,7 +21,6 @@ this file exists to catch, and all three are silent:
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
 
 import pytest
 
@@ -269,7 +268,6 @@ def test_the_payers_own_window_governs_in_their_own_zone():
 def test_the_configured_window_is_read_in_the_fallback_zone():
     """No stated window means the configured one, read as Asia/Kolkata -- not as
     whatever zone the server happens to be deployed in."""
-    thresholds = PolicyThresholds()
     facts = build_facts(
         _message_envelope(), _context(consent=_consent(quiet_hours=None))
     )

@@ -39,7 +39,7 @@ yet sourced, and a fact that is always False is a gate that has never fired.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Final, FrozenSet, Mapping

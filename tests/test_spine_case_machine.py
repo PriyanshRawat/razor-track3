@@ -15,7 +15,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from reclaim.contracts.enums import ActorType, CaseState, StopReason
+from reclaim.contracts.enums import CaseState, StopReason
 from reclaim.spine import audit_store, case_machine, ledger
 from reclaim.spine.errors import CaseNotFound, IllegalTransition
 
