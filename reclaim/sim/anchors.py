@@ -116,11 +116,11 @@ RECOVERY_PROBABILITY_CEILING: Decimal = probability("0.95")
 #: of asking for one thing. Same reach, worse conversion. Half is the midpoint of
 #: a band nobody has data for.
 #:
-#: Swept over its whole band on the n=200 seed, the headline moves by ₹0.16 L
-#: (A4-A0 from -₹2.50 L at 0.25 to -₹2.34 L at 0.50, unchanged at 0.75) -- so at
-#: this batch size the number is **not** load-bearing, and it was measured rather
-#: than assumed to be harmless. That is a statement about how few cases reach the
-#: hedge (13 of 2,000 draws), not about how well the constant is known: if the
+#: Swept over its whole band, the headline moves ₹0.16 L on the n=200 seed and
+#: ₹1.43 L on n=2000 under the eval allocation -- about 7% of a -₹20 L estimate.
+#: So the constant is **not** load-bearing today, and that was measured rather
+#: than assumed. It is a statement about how few cases reach the discounted lane
+#: (40 of 727 A4 cases at n=2000), not about how well the number is known: if the
 #: consent stand-in stops denying a third of all contacts, or a scheduler lands
 #: and quiet-hours denials become deferrals, the hedged population grows and this
 #: constant starts to matter. Re-sweep before quoting a headline, per §12.5.3.
