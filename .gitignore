@@ -46,3 +46,7 @@ desktop.ini
 scratch/
 scratchpad/
 *.log
+
+# Pitch artifacts
+RECLAIM_pitch_kit.html
+RECLAIM_pitch_kit.pdf
