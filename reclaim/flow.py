@@ -186,6 +186,8 @@ class CaseResult:
     reason: str = ""
     outbox_id: int | None = None
     final_state: CaseState = CaseState.DETECTED
+    hedged: bool = False
+    hedged_intent: MessageIntent | None = None
 
     @property
     def is_allowed(self) -> bool:
@@ -410,6 +412,90 @@ def route(
     return _message(case, obligation, target)
 
 
+#: The contact a *contested* dispatch is allowed to send when a debit is known to
+#: have failed. Chosen because it is the one registered intent that is true under
+#: every candidate the taxonomy files for an ambiguous decline: it reports the
+#: failure rather than asking for money, and carries both the completion door and
+#: the change-how-you-pay door, so H4 (finish the AFA), H3 (re-authorise) and H5
+#: (stop paying, deliberately) each have a one-tap answer.
+HEDGED_DECLINE_INTENT: MessageIntent = MessageIntent.PAYMENT_FAILED_INFORM
+
+#: The same, for a case where **no debit was ever attempted** -- an overdue
+#: receivable. ``PAYMENT_FAILED_INFORM`` would be a false statement there, and a
+#: template that lies is worse than an escalation. See ``hedged_route`` for why
+#: this one is a weaker guarantee than the decline hedge.
+HEDGED_RECEIVABLE_INTENT: MessageIntent = MessageIntent.PAYMENT_REMINDER
+
+
+def hedged_route(
+    case: RiskCase,
+    obligation: Obligation,
+    diagnosis: Diagnosis,
+    *,
+    at: datetime,
+) -> ActionEnvelope | None:
+    """The one contact a below-floor diagnosis may still send, or ``None``.
+
+    Why this exists at all
+    ----------------------
+    The confidence floor was answering the right question -- "should a contested
+    dispatch auto-act on a coin flip between opposite interventions?" -- with an
+    action, ``ESCALATED``, that Phase 1 has no consumer for. So the case did not
+    tier up; it stopped. Measured on the n=200 seed that was **25 of arm A4's 48
+    cases**, and it is the single reason A4 loses to A1's undifferentiated drip:
+    A1 contacts everyone at a modest uplift, A4 contacted 19% at a good one.
+
+    What it does **not** do
+    -----------------------
+    It does not lower the floor, and it does not raise the confidence. The
+    diagnosis is still reported contested, the case is still recorded as such
+    (``contested_diagnosis_hedged``), and the policy engine still evaluates the
+    proposal like any other. Two things are refused outright:
+
+    * **an abstention.** ``root_cause=UNKNOWN`` is not a contested dispatch, it is
+      a blank one -- there is no hypothesis for a hedge to be true under, and the
+      H6 abstention (§10.1's most damaging wrong call) arrives here. Nothing is
+      sent.
+    * **a debit.** §9.2 H3: re-presenting a dead mandate recovers 0% and still
+      costs a failed-attempt fee, and a contested dispatch is precisely the state
+      where H3 cannot be ruled out. A hedge is a contact or it is nothing.
+
+    The two hedges are not equally strong, and the difference is deliberate
+    ---------------------------------------------------------------------------
+    * **A failed debit (D1).** The candidates genuinely oppose -- H4 wants the AFA
+      finished, H5 wants to be left alone -- so the hedge is *not* the verb the
+      router would have chosen above the floor. It is a strictly weaker,
+      non-committal notification, and ``sim.anchors`` prices it below a correctly
+      targeted contact because that is what it is.
+    * **An overdue receivable (D3).** Here the hedge *is* what H9 would have
+      routed above the floor, so for this branch the fallback is equivalent to
+      admitting that filing H8 as an alternative never made the dispatch contested
+      in the first place -- H9 (chase) and H8 (our invoice is wrong) do not demand
+      opposite contacts; a reminder is how a defective invoice gets discovered.
+      That is a defensible outcome reached by the wrong route: the honest fix is
+      in the diagnostician's rung selection, not here. Recorded rather than
+      hidden, and it is why the two branches are counted separately in any report.
+    """
+    if diagnosis.root_cause is RootCauseClass.UNKNOWN:
+        return None
+    if not diagnosis.alternative_root_causes:
+        # Below the floor without alternatives means something other than a
+        # contested dispatch put it there -- a lowered threshold, or a future
+        # calibrated diagnosis that is simply unsure. Neither is this rule's
+        # business, and guessing an action for it is how a hedge becomes a
+        # general-purpose floor bypass.
+        return None
+    if case.canonical_decline_class is not None:
+        return _message(case, obligation, HEDGED_DECLINE_INTENT)
+    candidates = (diagnosis.root_cause, *diagnosis.alternative_root_causes)
+    if any(cause.forbids_payment_nudge for cause in candidates):
+        # No debit failed, so the only truthful contact left is a reminder -- and
+        # a reminder is a payment nudge. If any live hypothesis forbids one there
+        # is nothing honest to send.
+        return None
+    return _message(case, obligation, HEDGED_RECEIVABLE_INTENT)
+
+
 # ---------------------------------------------------------------------------
 # One case
 # ---------------------------------------------------------------------------
@@ -587,27 +673,64 @@ def process_case(
     )
 
     floor = Decimal(resolved.diagnosis_confidence_floor)
+    envelope: ActionEnvelope | None
     if diagnosis.confidence < floor:
-        reason = (
-            f"diagnosis confidence {diagnosis.confidence} is below the policy floor "
-            f"{floor}; §14.2 tiers up rather than acting"
-        )
-        case = case_machine.transition(
+        envelope = hedged_route(case, obligation, diagnosis, at=at)
+        if envelope is None:
+            reason = (
+                f"diagnosis confidence {diagnosis.confidence} is below the policy "
+                f"floor {floor} and no hedged contact is true under every candidate "
+                "cause; §14.2 tiers up rather than acting"
+            )
+            case = case_machine.transition(
+                conn,
+                case.case_id,
+                CaseState.ESCALATED,
+                actor=ActorType.AGENT,
+                at=at,
+                rationale=reason,
+            )
+            return CaseResult(
+                **base,
+                outcome=Outcome.ROUTED_TO_HUMAN_LOW_CONFIDENCE,
+                reason=reason,
+                final_state=case.state,
+            )
+        intent = envelope.action.intent
+        base["hedged"] = True
+        base["hedged_intent"] = intent
+        # Written *before* the policy evaluation, and unconditionally: a reader
+        # who finds a scheduled contact and no row here is entitled to read it as
+        # a confident intervention, so the hedge has to be on the chain whether or
+        # not the engine goes on to allow it.
+        audit_store.append(
             conn,
-            case.case_id,
-            CaseState.ESCALATED,
+            ts=at,
+            case_id=case.case_id,
             actor=ActorType.AGENT,
-            at=at,
-            rationale=reason,
+            event_type="contested_diagnosis_hedged",
+            inputs_digest=digest(
+                {
+                    "case_id": case.case_id,
+                    "confidence": str(diagnosis.confidence),
+                    "floor": str(floor),
+                    "root_cause": diagnosis.root_cause.value,
+                    "alternatives": [
+                        c.value for c in diagnosis.alternative_root_causes
+                    ],
+                    "hedged_intent": intent.value,
+                }
+            ),
+            decision_rationale=(
+                f"confidence {diagnosis.confidence} is below the floor {floor} and "
+                f"the dispatch is contested between {diagnosis.root_cause.value} and "
+                f"{', '.join(c.value for c in diagnosis.alternative_root_causes)}; "
+                f"sending {intent.value}, the least-committal contact true under "
+                "every candidate. The diagnosis is unchanged and no debit is taken."
+            )[:2000],
         )
-        return CaseResult(
-            **base,
-            outcome=Outcome.ROUTED_TO_HUMAN_LOW_CONFIDENCE,
-            reason=reason,
-            final_state=case.state,
-        )
-
-    envelope = route(case, obligation, diagnosis, at=at)
+    else:
+        envelope = route(case, obligation, diagnosis, at=at)
     if envelope is None:
         reason = (
             f"no action is routed for root cause {diagnosis.root_cause.value}; "

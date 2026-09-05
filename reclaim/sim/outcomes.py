@@ -100,6 +100,7 @@ anywhere in this module, so a replay decides identically whenever it runs.
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import StrEnum
@@ -108,7 +109,7 @@ from typing import Mapping, Sequence
 import sqlalchemy as sa
 from sqlalchemy.engine import Connection
 
-from reclaim.contracts.actions import ActionType
+from reclaim.contracts.actions import ActionEnvelope, ActionType
 from reclaim.contracts.canonical import digest
 from reclaim.contracts.case import RiskCase
 from reclaim.contracts.decline_taxonomy import (
@@ -116,7 +117,14 @@ from reclaim.contracts.decline_taxonomy import (
     DeclineClass,
     Retryability,
 )
-from reclaim.contracts.enums import Arm, ActorType, CaseState, RiskClass, StopReason
+from reclaim.contracts.enums import (
+    Arm,
+    ActorType,
+    CaseState,
+    MessageIntent,
+    RiskClass,
+    StopReason,
+)
 from reclaim.contracts.metrics import recovery_rate
 from reclaim.contracts.money import Money, money_sum
 from reclaim.contracts.units import probability, ratio
@@ -133,12 +141,14 @@ from reclaim.spine.tables import audit_log, outbox as outbox_table
 __all__ = [
     "ArmTally",
     "BatchResolution",
+    "HEDGED_CONTACT_INTENT",
     "IN_SCOPE_ARMS",
     "SIMULATED_RESPONSE_EVENT",
     "SIM_SALT",
     "SimLane",
     "SimulatedOutcome",
     "draw_for",
+    "hedged_contact_enqueued",
     "resolve_batch",
     "resolve_case",
     "tally_by_arm",
@@ -158,6 +168,16 @@ SIMULATED_RESPONSE_EVENT = "simulated_psp_response"
 
 #: §18.4's T-12h cut keeps A0, A1 and A4. A3 is dropped by this pass as well, which
 #: costs the A4-A3 decomposition -- see the module docstring, compromise 3.
+#: The message intent that marks a contact as ``flow``'s contested-dispatch
+#: hedge. Named from the frozen ``MessageIntent`` enum rather than imported from
+#: ``flow.HEDGED_DECLINE_INTENT``, because §12.5.4 item 4 forbids the simulator
+#: from importing agent code -- a sim that can reach ``flow`` is somewhere a
+#: detector could learn the answer. The duplication is deliberate and is pinned:
+#: ``tests/test_sim_outcomes.py`` asserts the two constants are the same member,
+#: so changing one without the other fails the build rather than silently
+#: scoring every hedge at full price.
+HEDGED_CONTACT_INTENT: MessageIntent = MessageIntent.PAYMENT_FAILED_INFORM
+
 IN_SCOPE_ARMS: frozenset[Arm] = frozenset({Arm.A0, Arm.A1, Arm.A4})
 
 #: A failed debit permits another attempt only on these two. Derived by subtraction
@@ -199,6 +219,11 @@ class SimulatedOutcome:
     draw: Decimal | None
     simulated_contacts: int
     reason: str
+    #: True when the enqueued contact was ``flow``'s contested-dispatch
+    #: hedge, so the draw used a discounted uplift. Carried on the outcome
+    #: (not only in the audit row) because a scoreboard that cannot separate
+    #: hedged recoveries from targeted ones cannot report either honestly.
+    hedged: bool = False
 
     @property
     def was_simulated(self) -> bool:
@@ -408,6 +433,39 @@ def _enqueued_verb(conn: Connection, case_id: str) -> ActionType | None:
     return ActionType(raw) if raw is not None else None
 
 
+def hedged_contact_enqueued(conn: Connection, case_id: str) -> bool:
+    """Whether the contact in the outbox is ``flow``'s contested-dispatch hedge.
+
+    Read from the enqueued envelope's **intent**, not from the case state and not
+    from the ``contested_diagnosis_hedged`` audit row. Two reasons, in order:
+
+    * the case state cannot say this at all -- a hedged case and a confidently
+      routed one both sit in ``scheduled`` with one ``send_message`` in the
+      outbox, so the arm's whole coverage gain would be indistinguishable from
+      diagnostic skill;
+    * the envelope is the thing that would actually be delivered. If the audit
+      row and the outbox ever disagree, the payer receives what is in the outbox,
+      and the simulator has to score what the payer receives.
+
+    ``PAYMENT_FAILED_INFORM`` is the marker because it is the only intent
+    ``flow`` sends without a resolved cause (``HEDGED_DECLINE_INTENT``). The
+    receivable hedge is deliberately *not* counted: it re-uses
+    ``PAYMENT_REMINDER``, which is exactly what H9 routes above the floor, so
+    there is no weaker message to discount -- see ``flow.hedged_route`` for why
+    that branch is a concession rather than a hedge.
+    """
+    raw = conn.execute(
+        sa.select(outbox_table.c.envelope)
+        .where(outbox_table.c.case_id == case_id)
+        .order_by(outbox_table.c.id.asc())
+        .limit(1)
+    ).scalar_one_or_none()
+    if raw is None:
+        return False
+    envelope = ActionEnvelope.model_validate(json.loads(raw))
+    return getattr(envelope.action, "intent", None) is HEDGED_CONTACT_INTENT
+
+
 def _further_debit_permitted(decline_class: DeclineClass | None) -> bool:
     """Whether another debit attempt on this class has non-zero probability.
 
@@ -463,6 +521,7 @@ def resolve_case(
         return _not_simulated(case, why)
 
     verb = _enqueued_verb(conn, case_id) if lane is SimLane.TARGETED_AGENT else None
+    hedged = False
     decline_class, risk_class = case.canonical_decline_class, case.risk_class
 
     if lane in (SimLane.NATURAL_ONLY, SimLane.NATURAL_FLOOR):
@@ -472,7 +531,8 @@ def resolve_case(
         chance = generic_probability(decline_class, risk_class)
         contacts = GENERIC_TOUCH_COUNT
     else:
-        chance = targeted_probability(decline_class, risk_class, verb)
+        hedged = hedged_contact_enqueued(conn, case_id)
+        chance = targeted_probability(decline_class, risk_class, verb, hedged=hedged)
         contacts = 1 if verb is ActionType.SEND_MESSAGE else 0
 
     draw = draw_for(case_id, case.arm, salt=salt)
@@ -495,6 +555,7 @@ def resolve_case(
                 "decline_class": decline_class.value if decline_class else None,
                 "risk_class": risk_class.value,
                 "action_type": verb.value if verb else None,
+                "hedged": hedged,
                 "probability": str(chance),
                 "draw": str(draw),
                 "recovered": recovered,
@@ -506,7 +567,8 @@ def resolve_case(
         decision_rationale=(
             f"SIMULATED PSP RESPONSE -- reclaim.sim, not a real payment rail. "
             f"arm={case.arm.value} lane={lane.value} "
-            f"verb={verb.value if verb else 'none'} "
+            f"verb={verb.value if verb else 'none'}"
+            f"{' (HEDGED: contested diagnosis, discounted uplift)' if hedged else ''} "
             f"p={chance} draw={draw} -> "
             f"{'recovered' if recovered else 'not recovered'}. "
             f"Probability is an assumption from sim.anchors {ANCHORS_VERSION} "
@@ -534,6 +596,7 @@ def resolve_case(
         probability=chance,
         draw=draw,
         simulated_contacts=contacts,
+        hedged=hedged,
         reason=(
             ("recovered inside the window" if recovered else "not recovered inside the window")
             + (f"; natural floor only -- {why}" if lane is SimLane.NATURAL_FLOOR else "")

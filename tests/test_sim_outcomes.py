@@ -39,7 +39,7 @@ import sqlalchemy as sa
 from reclaim.contracts.actions import ActionType
 from reclaim.contracts.audit import verify_chain
 from reclaim.contracts.decline_taxonomy import DeclineClass
-from reclaim.contracts.enums import Arm, CaseState, StopReason
+from reclaim.contracts.enums import Arm, CaseState, RootCauseClass, StopReason
 from reclaim.contracts.money import Money
 from reclaim.contracts.units import PROBABILITY_SCALE
 from reclaim.sim import anchors, outcomes
@@ -842,3 +842,111 @@ def test_a_second_pass_is_recognised_from_the_audit_log_not_from_the_state(
     assert second.lane is outcomes.SimLane.NOT_SIMULATED
     assert "already" in second.reason
     assert len(_sim_rows(conn, case.case_id)) == 1
+
+
+# --------------------------------------------------- the hedged contact lane
+#
+# ``flow.hedged_route`` lets a contested diagnosis send one non-committal contact
+# rather than escalating into a queue with no consumer. The simulator has to
+# score that contact for what it is -- the right channel, the wrong certainty --
+# or the coverage it buys is credited to the diagnostician.
+
+
+def _hedged_envelope(case, obligation):
+    """Exactly what ``flow`` enqueues for a contested D1 dispatch."""
+    envelope = flow._message(case, obligation, flow.HEDGED_DECLINE_INTENT)
+    assert envelope is not None, "no template registered for the decline hedge"
+    return envelope
+
+
+def test_a_hedged_contact_is_scored_below_the_same_contact_sent_with_certainty(
+    conn, make_obligation, make_case
+):
+    """Same verb, same channel, same payer -- lower probability, because the
+    agent did not know which of three causes it was answering."""
+    ambiguous = DeclineClass.PAYER_AUTHORIZATION_MISSING_AMBIGUOUS
+    targeted = _open(
+        conn, make_obligation, make_case,
+        case_id="case_0501", arm=Arm.A4, canonical_decline_class=ambiguous,
+    )
+    hedged = _open(
+        conn, make_obligation, make_case,
+        case_id="case_0502", arm=Arm.A4, canonical_decline_class=ambiguous,
+    )
+    obligation = ledger.get_obligation(conn, targeted.obligation_id)
+    _schedule(
+        conn, targeted,
+        flow._message(
+            targeted, obligation,
+            flow._ROUTES[RootCauseClass.H4_AFA_STEP_UP_INCOMPLETE],
+        ),
+    )
+    _schedule(conn, hedged, _hedged_envelope(hedged, obligation))
+
+    confident = outcomes.resolve_case(conn, "case_0501")
+    unsure = outcomes.resolve_case(conn, "case_0502")
+    assert confident.action_type is unsure.action_type is ActionType.SEND_MESSAGE
+    assert unsure.probability < confident.probability
+    assert unsure.probability > anchors.natural_probability(ambiguous, None)
+
+
+def test_the_hedge_is_recognised_from_the_outbox_not_from_the_case_state(
+    conn, make_obligation, make_case
+):
+    """The simulator resolves the action that was *taken*. It reads the enqueued
+    envelope's intent, so a case that reached ``scheduled`` some other way cannot
+    be mistaken for a hedge, and a hedge cannot be scrubbed by editing the case
+    row."""
+    ambiguous = DeclineClass.PAYER_AUTHORIZATION_MISSING_AMBIGUOUS
+    case = _open(
+        conn, make_obligation, make_case,
+        case_id="case_0503", arm=Arm.A4, canonical_decline_class=ambiguous,
+    )
+    obligation = ledger.get_obligation(conn, case.obligation_id)
+    _schedule(conn, case, _hedged_envelope(case, obligation))
+    assert outcomes.hedged_contact_enqueued(conn, "case_0503") is True
+
+
+def test_a_targeted_contact_is_not_read_as_a_hedge(
+    conn, make_obligation, make_case
+):
+    case = _open(
+        conn, make_obligation, make_case,
+        case_id="case_0504", arm=Arm.A4,
+        canonical_decline_class=DeclineClass.CARD_EXPIRED,
+    )
+    obligation = ledger.get_obligation(conn, case.obligation_id)
+    _schedule(
+        conn, case,
+        flow._message(
+            case, obligation,
+            flow._ROUTES[RootCauseClass.H2_CREDENTIAL_LIFECYCLE],
+        ),
+    )
+    assert outcomes.hedged_contact_enqueued(conn, "case_0504") is False
+
+
+def test_the_simulated_row_records_that_the_draw_was_hedged(
+    conn, make_obligation, make_case
+):
+    """A scoreboard traced back to this row must be able to tell a hedged
+    recovery from a targeted one without re-running the flow."""
+    case = _open(
+        conn, make_obligation, make_case,
+        case_id="case_0505", arm=Arm.A4,
+        canonical_decline_class=DeclineClass.PAYER_AUTHORIZATION_MISSING_AMBIGUOUS,
+    )
+    obligation = ledger.get_obligation(conn, case.obligation_id)
+    _schedule(conn, case, _hedged_envelope(case, obligation))
+    outcome = outcomes.resolve_case(conn, "case_0505")
+    assert outcome.hedged is True
+    row = _sim_rows(conn, "case_0505")[0]
+    assert "hedged" in row.decision_rationale.lower()
+
+
+def test_the_sim_and_the_flow_agree_on_which_intent_marks_a_hedge():
+    """``sim`` may not import ``flow`` (§12.5.4 item 4), so the marker intent is
+    named twice. This is the join. Without it, renaming the flow-side constant
+    would leave the simulator scoring every hedge at the full targeted uplift and
+    nothing would fail."""
+    assert outcomes.HEDGED_CONTACT_INTENT is flow.HEDGED_DECLINE_INTENT

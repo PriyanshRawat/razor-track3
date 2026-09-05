@@ -7,7 +7,7 @@ so ``template_for`` returns ``None`` for an intent/language pair nobody has
 registered, and ``facts.py`` turns a missing registration into
 ``TEMPLATE_IS_DLT_REGISTERED = False``.
 
-This registry is small and real, not a stub: four templates covering the intents
+This registry is small and real, not a stub: five templates covering the intents
 the Phase 1 router emits, each with the slot names its copy contains and the
 languages it is registered for. What it does *not* have is the copy itself --
 rendering is the executor's job, and a template body in here would be the first
@@ -90,6 +90,21 @@ TEMPLATE_REGISTRY: Mapping[str, TemplateSpec] = {
             "tpl_mandate_reauth_v1",
             MessageIntent.MANDATE_REAUTH_REQUEST,
             slots=("amount_due", "merchant_name", "reauth_link"),
+        ),
+        # The only template registered for a diagnosis the agent has *not*
+        # resolved. It states what happened -- a debit did not go through -- and
+        # carries two doors rather than one ask: complete the authentication
+        # (``afa_link``) or change how you pay (``update_link``). It is
+        # deliberately not a payment reminder: under H5 (deliberate churn intent)
+        # §9.2 forbids the nudge, and the honest behaviour there is not silence
+        # but a clean exit the payer can take in one tap. The cost of the second
+        # door is real -- it makes leaving easier for a payer who would otherwise
+        # have drifted back -- and ``sim.anchors`` prices the whole template below
+        # a correctly targeted one for exactly that reason.
+        _spec(
+            "tpl_payment_failed_inform_v1",
+            MessageIntent.PAYMENT_FAILED_INFORM,
+            slots=("amount_due", "merchant_name", "afa_link", "update_link"),
         ),
     )
 }

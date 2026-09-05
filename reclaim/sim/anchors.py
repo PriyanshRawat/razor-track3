@@ -70,6 +70,8 @@ __all__ = [
     "GENERIC_TOUCH_COUNT",
     "GENERIC_TOUCH_DECAY",
     "GENERIC_UPLIFT_FIRST_TOUCH",
+    "HEDGED_UPLIFT_SHARE",
+    "HEDGED_UPLIFT_SHARE_BAND",
     "RECOVERY_PROBABILITY_CEILING",
     "RISK_CLASS_ANCHORS",
     "RecoveryAnchor",
@@ -102,6 +104,33 @@ ANCHOR_HONESTY_NOTE = (
 #: No intervention is modelled as certain. A ceiling also keeps
 #: ``natural + uplift`` inside [0, 1] without the caller checking.
 RECOVERY_PROBABILITY_CEILING: Decimal = probability("0.95")
+
+#: What share of a correctly targeted contact's uplift a **hedged** contact earns
+#: -- the one non-committal message ``flow.hedged_route`` sends when the diagnosis
+#: is contested and the candidate causes want opposite things.
+#:
+#: **This is an assumption, not a measurement.** The reasoning is that the
+#: hedge reaches *the same audience* as the targeted message -- it is delivered on
+#: the same channel, to the same payer, carrying the same working link -- but with
+#: a weaker call to action, because it reports a fact and offers two doors instead
+#: of asking for one thing. Same reach, worse conversion. Half is the midpoint of
+#: a band nobody has data for.
+#:
+#: Swept over its whole band on the n=200 seed, the headline moves by ₹0.16 L
+#: (A4-A0 from -₹2.50 L at 0.25 to -₹2.34 L at 0.50, unchanged at 0.75) -- so at
+#: this batch size the number is **not** load-bearing, and it was measured rather
+#: than assumed to be harmless. That is a statement about how few cases reach the
+#: hedge (13 of 2,000 draws), not about how well the constant is known: if the
+#: consent stand-in stops denying a third of all contacts, or a scheduler lands
+#: and quiet-hours denials become deferrals, the hedged population grows and this
+#: constant starts to matter. Re-sweep before quoting a headline, per §12.5.3.
+HEDGED_UPLIFT_SHARE: Decimal = Decimal("0.5")
+
+#: The band ``HEDGED_UPLIFT_SHARE`` was invented within. The low end says a hedge
+#: is worth a quarter of the right message (most of the audience needed the
+#: specific instruction); the high end says three quarters (the link did the work
+#: and the copy barely mattered). Nothing here rules out either.
+HEDGED_UPLIFT_SHARE_BAND: tuple[Decimal, Decimal] = (Decimal("0.25"), Decimal("0.75"))
 
 # --- arm A1: the static drip -------------------------------------------------
 #
@@ -424,6 +453,8 @@ def targeted_probability(
     decline_class: DeclineClass | None,
     risk_class: RiskClass | None,
     verb: ActionType | None,
+    *,
+    hedged: bool = False,
 ) -> Decimal:
     """Arm A4: natural recovery plus an uplift that depends on the verb chosen.
 
@@ -432,15 +463,27 @@ def targeted_probability(
     ``uplift_wrong``, which for a dead mandate is zero. This is the only place the
     simulator rewards *diagnosis quality* rather than activity, and it is the reason
     an A4 number here is not automatically above A1's.
+
+    ``hedged=True`` is the third case: the right *verb*, sent without having
+    resolved the cause -- ``flow``'s contested-dispatch fallback. It earns
+    ``HEDGED_UPLIFT_SHARE`` of the targeted uplift, which keeps the fallback's
+    coverage from reading as diagnostic skill. See that constant for how much of
+    the resulting headline rests on a number nobody has measured.
     """
     anchor = _anchor_for(decline_class, risk_class)
     if verb is None:
         return _clamp(anchor.natural)
-    uplift = (
-        anchor.uplift_correct
-        if anchor.correct_verb is not None and verb is anchor.correct_verb
-        else anchor.uplift_wrong
-    )
+    if anchor.correct_verb is not None and verb is anchor.correct_verb:
+        uplift = anchor.uplift_correct
+        if hedged:
+            # Only the *correct* verb is discounted. A hedge is not a licence for
+            # a mistargeted action to earn something it otherwise would not --
+            # ``uplift_wrong`` is zero for the mandate classes on purpose (§9.2
+            # H3), and multiplying zero by a share must not become a way around
+            # that.
+            uplift = probability(uplift * HEDGED_UPLIFT_SHARE)
+    else:
+        uplift = anchor.uplift_wrong
     return _clamp(anchor.natural + uplift)
 
 

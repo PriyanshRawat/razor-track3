@@ -37,17 +37,24 @@ import sqlalchemy as sa
 
 from reclaim.contracts.actions import ActionType
 from reclaim.contracts.audit import verify_chain
+from reclaim.contracts.case import Diagnosis
+from reclaim.contracts.decline_taxonomy import DeclineClass
 from reclaim.contracts.enums import (
     ARM_SPECS,
     Arm,
     AutonomyTier,
     CaseState,
+    MessageIntent,
+    ObligationKind,
     PolicyEffect,
+    RiskClass,
     RootCauseClass,
     StopReason,
 )
 from reclaim.contracts.money import Money
+from reclaim.contracts.obligations import Obligation, ObligationStatus
 from reclaim.contracts.policy_format import PolicyThresholds
+from reclaim.diagnosis.deterministic import diagnose
 from reclaim.spine import audit_store, ledger, seed
 from reclaim.spine.tables import outbox as outbox_table
 from reclaim import flow
@@ -60,6 +67,21 @@ def _run(conn, **over):
 
 def _by_case(results):
     return {r.case_id: r for r in results}
+
+
+def _obligation_for(case):
+    """The obligation a hand-built case refers to. Never persisted: the tests
+    that use it call ``flow.hedged_route``, which is a pure function and touches
+    only ``due_at`` (one template slot)."""
+    return Obligation(
+        obligation_id=case.obligation_id,
+        kind=ObligationKind.SUBSCRIPTION_INVOICE,
+        payer_id=case.payer_id,
+        gross_amount=case.amount_at_risk,
+        issued_at=case.detected_at - timedelta(days=30),
+        due_at=case.detected_at - timedelta(days=2),
+        status=ObligationStatus.OPEN,
+    )
 
 
 # ------------------------------------------------------------ the whole path
@@ -216,10 +238,17 @@ def test_the_policy_disabled_arm_is_refused_rather_than_evaluated(conn):
         assert result.outbox_id is None
 
 
-def test_a_contested_diagnosis_is_routed_to_a_human_not_acted_on(conn):
+def test_a_contested_diagnosis_is_never_acted_on_as_though_it_were_clean(conn):
     """The deterministic diagnostician reports a contested dispatch below the
     policy confidence floor precisely so nothing downstream auto-acts on a coin
-    flip between opposite interventions."""
+    flip between opposite interventions.
+
+    This used to assert that such a case escalated and stopped. It no longer
+    does -- ``flow.hedged_route`` lets it send one non-committal contact -- so
+    what is pinned here is the part that did not change and must not: below the
+    floor the case is either escalated with no action at all, or contacted as a
+    declared hedge. There is no third path, and in particular no case arrives at
+    the router's targeted verb by being unsure."""
     _, results = _run(conn)
     floor = Decimal(PolicyThresholds().diagnosis_confidence_floor)
     contested = [
@@ -227,7 +256,11 @@ def test_a_contested_diagnosis_is_routed_to_a_human_not_acted_on(conn):
     ]
     assert contested
     for result in contested:
+        if result.hedged:
+            assert result.action_type is ActionType.SEND_MESSAGE
+            continue
         assert result.outcome is flow.Outcome.ROUTED_TO_HUMAN_LOW_CONFIDENCE
+        assert result.action_type is None
         assert ledger.get_case(conn, result.case_id).state is CaseState.ESCALATED
 
 
@@ -399,3 +432,148 @@ def test_the_consent_and_holds_gates_deny_on_real_seeded_data(conn):
     deciding = {r.deciding_rule_id for r in results if r.effect is PolicyEffect.DENY}
     assert "POL-CONSENT-001" in deciding
     assert "POL-HOLDS-001" in deciding
+
+
+# ------------------------------------------ the contested-diagnosis fallback
+#
+# Below the confidence floor the case used to stop dead: escalated to a human
+# queue that Phase 1 has no consumer for. These tests pin the narrower rule that
+# replaced it -- a *contested* dispatch (a named primary plus named alternatives)
+# earns the least-committal contact that is true under every named hypothesis,
+# and nothing else changes.
+
+
+def _contested(results):
+    floor = Decimal(PolicyThresholds().diagnosis_confidence_floor)
+    return [r for r in results if r.confidence is not None and r.confidence < floor]
+
+
+def test_a_contested_diagnosis_takes_a_hedged_contact_rather_than_stopping_dead(conn):
+    """The behaviour change. A contested dispatch reaches the policy engine on a
+    hedged contact instead of escalating to a queue with no consumer."""
+    _, results = _run(conn, n=COVERAGE_CASE_COUNT)
+    contested = _contested(results)
+    assert contested
+    hedged = [r for r in contested if r.hedged]
+    assert hedged, "no contested case took the hedged contact"
+    for result in hedged:
+        assert result.effect is not None, "the hedge skipped the policy engine"
+        assert result.action_type is ActionType.SEND_MESSAGE
+
+
+def test_a_contested_diagnosis_never_schedules_a_debit(conn):
+    """The load-bearing half. §9.2 H3: retrying a dead mandate is 0% and still
+    costs a fee, and a contested dispatch is exactly the state where we cannot
+    rule that out. A hedge is a contact or it is nothing."""
+    _, results = _run(conn, n=COVERAGE_CASE_COUNT)
+    for result in _contested(results):
+        assert result.action_type is not ActionType.SCHEDULE_DEBIT
+
+
+def test_the_hedge_says_only_what_is_true_of_the_case(conn):
+    """The hedge intent is chosen by what actually happened, not by convenience.
+
+    ``PAYMENT_FAILED_INFORM`` on an overdue receivable would be a false statement
+    -- no debit was ever attempted on it -- and a registered template that lies is
+    worse than an escalation. So a failed debit gets the failure notice and a
+    receivable gets a reminder."""
+    _, results = _run(conn, n=COVERAGE_CASE_COUNT)
+    hedged = [r for r in _contested(results) if r.hedged]
+    assert hedged
+    seen = set()
+    for result in hedged:
+        expected = (
+            MessageIntent.PAYMENT_FAILED_INFORM
+            if result.decline_class is not None
+            else MessageIntent.PAYMENT_REMINDER
+        )
+        assert result.hedged_intent is expected
+        seen.add(expected)
+    assert seen == {
+        MessageIntent.PAYMENT_FAILED_INFORM,
+        MessageIntent.PAYMENT_REMINDER,
+    }, "the seed no longer exercises both hedge branches"
+
+
+def test_the_receivable_hedge_is_the_same_verb_h9_would_have_routed(conn):
+    """A disclosed weakness, pinned so it cannot be forgotten.
+
+    For a D3 overdue receivable the hedge is ``PAYMENT_REMINDER`` -- exactly what
+    the router picks for H9 above the floor. So on this branch the fallback is
+    equivalent to conceding that filing H8 as an alternative never made the
+    dispatch genuinely contested: H9 (chase) and H8 (our invoice is wrong) do not
+    demand opposite contacts. The honest fix is in the diagnostician's rung
+    selection. If someone repairs that, this test fails and points at the note in
+    ``flow.hedged_route`` explaining why."""
+    assert (
+        flow.HEDGED_RECEIVABLE_INTENT
+        is flow._ROUTES[RootCauseClass.H9_B2B_LIQUIDITY_OR_WILLFUL_DELAY]
+    )
+
+
+def test_an_abstaining_diagnosis_is_refused_a_hedge(make_case):
+    """``root_cause=UNKNOWN`` is not contested, it is blank. There is no
+    hypothesis for a hedge to be true under, so nothing is sent.
+
+    Tested against ``hedged_route`` directly rather than through the seed,
+    because ``seed.generate`` draws only four decline classes and none of them
+    abstains -- so a seeded assertion here would pass over an empty list. That
+    gap is itself worth knowing: the H6 abstention (§10.1's most damaging wrong
+    call) is the branch this rule most needs to refuse, and the seeded run never
+    reaches it."""
+    case = make_case(canonical_decline_class=DeclineClass.PROCESSING_ERROR)
+    obligation = _obligation_for(case)
+    dx = diagnose(case, created_at=case.detected_at)
+    assert dx.root_cause is RootCauseClass.UNKNOWN
+    assert flow.hedged_route(case, obligation, dx, at=case.detected_at) is None
+
+
+def test_a_receivable_hedge_is_refused_when_a_candidate_forbids_the_nudge(
+    make_case,
+):
+    """The only truthful contact for a receivable is a reminder, and a reminder is
+    a payment nudge. §9.2 forbids one under H5/H6/H7, so on that combination there
+    is nothing honest left to send and the case escalates."""
+    case = make_case(risk_class=RiskClass.OVERDUE_RECEIVABLE)
+    obligation = _obligation_for(case)
+    dx = diagnose(case, created_at=case.detected_at)
+    assert dx.root_cause is RootCauseClass.H9_B2B_LIQUIDITY_OR_WILLFUL_DELAY
+    assert flow.hedged_route(case, obligation, dx, at=case.detected_at) is not None
+
+    # Rebuilt field by field, not via ``model_dump``: dumping a Diagnosis emits
+    # its computed fields too, and feeding those back to an ``extra="forbid"``
+    # model is a validation error rather than a round trip. ``model_copy`` is not
+    # an option either -- it skips the validators this test needs to run.
+    disputed = Diagnosis(
+        **{name: getattr(dx, name) for name in Diagnosis.model_fields},
+    ).model_copy(
+        update={"alternative_root_causes": (RootCauseClass.H7_COMMERCIAL_DISPUTE,)}
+    )
+    assert disputed.alternative_root_causes == (
+        RootCauseClass.H7_COMMERCIAL_DISPUTE,
+    )
+    assert flow.hedged_route(case, obligation, disputed, at=case.detected_at) is None
+
+
+def test_the_hedged_contact_is_recorded_as_contested_in_the_audit_chain(conn):
+    """A hedge must be auditable as a hedge. Reading back a scheduled contact and
+    finding no trace that its diagnosis was contested would let the run be
+    reported as a confident intervention."""
+    _, results = _run(conn, n=COVERAGE_CASE_COUNT)
+    hedged = {r.case_id for r in results if r.hedged}
+    assert hedged
+    rows = {
+        row.case_id
+        for row in audit_store.read_all(conn)
+        if row.event_type == "contested_diagnosis_hedged"
+    }
+    assert rows == hedged
+
+
+def test_the_hedge_leaves_the_confidence_untouched(conn):
+    """The diagnosis did not get better. Only its consequence changed."""
+    _, results = _run(conn, n=COVERAGE_CASE_COUNT)
+    floor = Decimal(PolicyThresholds().diagnosis_confidence_floor)
+    for result in results:
+        if result.hedged:
+            assert result.confidence < floor

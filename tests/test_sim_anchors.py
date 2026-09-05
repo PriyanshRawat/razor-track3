@@ -219,3 +219,73 @@ def test_a_case_with_no_decline_class_falls_back_to_its_risk_class():
 def test_asking_for_no_key_at_all_is_a_programming_error_not_a_default():
     with pytest.raises(ValueError):
         anchors.natural_probability(None, None)
+
+
+def _split(key):
+    """``all_anchors`` merges two disjoint enums; ``targeted_probability``
+    takes them on separate parameters."""
+    if isinstance(key, DeclineClass):
+        return key, None
+    return None, key
+
+
+# ------------------------------------------------------------- the hedge share
+#
+# ``flow.hedged_route`` lets a case whose diagnosis is *contested* send one
+# non-committal contact instead of escalating into a queue with no consumer. The
+# simulator must not pay for that contact as though the cause had been resolved,
+# or the coverage it buys reads as diagnostic skill.
+
+
+def test_a_hedged_contact_earns_less_than_a_correctly_targeted_one():
+    """The whole point. If these were equal, routing the right message and
+    shrugging would score the same and A4's number would stop measuring
+    diagnosis."""
+    for key, anchor in anchors.all_anchors().items():
+        if anchor.correct_verb is None or anchor.uplift_correct == 0:
+            continue
+        decline, risk = _split(key)
+        targeted = anchors.targeted_probability(decline, risk, anchor.correct_verb)
+        hedged = anchors.targeted_probability(
+            decline, risk, anchor.correct_verb, hedged=True
+        )
+        assert hedged < targeted, key
+
+
+def test_a_hedged_contact_still_earns_more_than_no_contact_at_all():
+    """The other side. A hedge that scored the natural rate would make the
+    fallback invisible in the numbers, which is just as dishonest in the other
+    direction -- a real message with a working link does reach the payer."""
+    for key, anchor in anchors.all_anchors().items():
+        if anchor.correct_verb is None or anchor.uplift_correct == 0:
+            continue
+        decline, risk = _split(key)
+        hedged = anchors.targeted_probability(
+            decline, risk, anchor.correct_verb, hedged=True
+        )
+        assert hedged > anchors.natural_probability(decline, risk), key
+
+
+def test_a_hedged_wrong_verb_is_still_a_wrong_verb():
+    """The discount applies to the *correct* verb sent without resolving the
+    cause. It must not become a way for a mistargeted action to earn something:
+    a hedged debit on a dead mandate is still worth exactly zero."""
+    for key, anchor in anchors.all_anchors().items():
+        if anchor.correct_verb is not ActionType.SEND_MESSAGE:
+            continue
+        decline, risk = _split(key)
+        wrong = ActionType.SCHEDULE_DEBIT
+        assert anchors.targeted_probability(
+            decline, risk, wrong, hedged=True
+        ) == anchors.targeted_probability(decline, risk, wrong), key
+
+
+def test_the_hedge_share_is_a_stated_assumption_inside_its_own_band():
+    """§11.2's convention: an invented number carries the band it was invented
+    within, and the band is what a sensitivity run sweeps."""
+    low, high = anchors.HEDGED_UPLIFT_SHARE_BAND
+    assert Decimal("0") < low <= anchors.HEDGED_UPLIFT_SHARE <= high < Decimal("1")
+
+
+def test_the_hedge_share_note_says_it_is_an_assumption():
+    assert "assum" in anchors.ANCHOR_HONESTY_NOTE.lower()
